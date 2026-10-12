@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Local storage
+storage/
+!storage/.gitkeep
+!storage/audio/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Build / dist
+build/
+dist/
+*.tar.gz
+
+# Test artifacts
+tests/.cache/
+
+# Runtime artifacts
+downloads/
+*.db
+*.db-*
+
+# runtime mirror index (self-heal cache)
+data/mirror_index.json

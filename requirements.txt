@@ -1,0 +1,28 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.7.0
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+alembic==1.14.0
+redis[hiredis]==5.2.1
+httpx==0.28.1
+aiofiles==24.1.0
+python-multipart==0.0.20
+prometheus-client==0.21.1
+python-json-logger==3.2.1
+boto3==1.35.84
+# yt-dlp is a CLI dependency; the provider shells out to `python3 -m yt_dlp`
+# when the binary is installed. It is NOT imported at app startup, so the
+# app still boots without it. The YouTube provider is disabled in that case.
+yt-dlp>=2024.8.6
+# spotipy is a lazy import inside SpotifyProvider; optional, only used when
+# SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are both set.
+spotipy>=2.24.0
+pytest==8.3.4
+pytest-asyncio==0.25.0
+aiosqlite==0.20.0
+fakeredis==2.26.1
+httpx==0.28.1
+yt-dlp-ejs>=0.3.0

@@ -1,0 +1,373 @@
+[
+  {
+    "video_id": "dQw4w9WgXcQ",
+    "title": "Never Gonna Give You Up",
+    "artist": "Rick Astley",
+    "stream_url": "/api/file/dQw4w9WgXcQ",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+    "duration_seconds": 214,
+    "tags": [
+      "pop",
+      "80s",
+      "rickroll",
+      "dance"
+    ]
+  },
+  {
+    "video_id": "9bZkp7q19f0",
+    "title": "Gangnam Style",
+    "artist": "PSY",
+    "stream_url": "/api/file/9bZkp7q19f0",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/9bZkp7q19f0/hqdefault.jpg",
+    "duration_seconds": 253,
+    "tags": [
+      "pop",
+      "k-pop",
+      "dance",
+      "viral"
+    ]
+  },
+  {
+    "video_id": "fJ9rUzIMcZQ",
+    "title": "Bohemian Rhapsody",
+    "artist": "Queen",
+    "stream_url": "/api/file/fJ9rUzIMcZQ",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/fJ9rUzIMcZQ/hqdefault.jpg",
+    "duration_seconds": 360,
+    "tags": [
+      "rock",
+      "classic rock",
+      "70s",
+      "epic"
+    ]
+  },
+  {
+    "video_id": "Zi_XLOBDo_Y",
+    "title": "Billie Jean",
+    "artist": "Michael Jackson",
+    "stream_url": "/api/file/Zi_XLOBDo_Y",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/Zi_XLOBDo_Y/hqdefault.jpg",
+    "duration_seconds": 296,
+    "tags": [
+      "pop",
+      "r&b",
+      "80s",
+      "funk"
+    ]
+  },
+  {
+    "video_id": "hTWKbfoikeg",
+    "title": "Smells Like Teen Spirit",
+    "artist": "Nirvana",
+    "stream_url": "/api/file/hTWKbfoikeg",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/hTWKbfoikeg/hqdefault.jpg",
+    "duration_seconds": 279,
+    "tags": [
+      "rock",
+      "grunge",
+      "90s",
+      "alternative"
+    ]
+  },
+  {
+    "video_id": "7wtfhZwyrcc",
+    "title": "Believer",
+    "artist": "Imagine Dragons",
+    "stream_url": "/api/file/7wtfhZwyrcc",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/7wtfhZwyrcc/hqdefault.jpg",
+    "duration_seconds": 217,
+    "tags": [
+      "pop rock",
+      "alternative",
+      "2010s"
+    ]
+  },
+  {
+    "video_id": "4NRXx6U8ABQ",
+    "title": "Blinding Lights",
+    "artist": "The Weeknd",
+    "stream_url": "/api/file/4NRXx6U8ABQ",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/4NRXx6U8ABQ/hqdefault.jpg",
+    "duration_seconds": 263,
+    "tags": [
+      "pop",
+      "synthwave",
+      "2020s"
+    ]
+  },
+  {
+    "video_id": "60ItHLz5WEA",
+    "title": "Faded",
+    "artist": "Alan Walker",
+    "stream_url": "/api/file/60ItHLz5WEA",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/60ItHLz5WEA/hqdefault.jpg",
+    "duration_seconds": 213,
+    "tags": [
+      "edm",
+      "electronic",
+      "tropical"
+    ]
+  },
+  {
+    "video_id": "JGwWNGJdvx8",
+    "title": "Shape of You",
+    "artist": "Ed Sheeran",
+    "stream_url": "/api/file/JGwWNGJdvx8",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/JGwWNGJdvx8/hqdefault.jpg",
+    "duration_seconds": 264,
+    "tags": [
+      "pop",
+      "2010s",
+      "acoustic"
+    ]
+  },
+  {
+    "video_id": "kJQP7kiw5Fk",
+    "title": "Despacito",
+    "artist": "Luis Fonsi ft. Daddy Yankee",
+    "stream_url": "/api/file/kJQP7kiw5Fk",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/kJQP7kiw5Fk/hqdefault.jpg",
+    "duration_seconds": 282,
+    "tags": [
+      "pop",
+      "latin",
+      "reggaeton"
+    ]
+  },
+  {
+    "video_id": "RgKAFK5djSk",
+    "title": "See You Again",
+    "artist": "Wiz Khalifa ft. Charlie Puth",
+    "stream_url": "/api/file/RgKAFK5djSk",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/RgKAFK5djSk/hqdefault.jpg",
+    "duration_seconds": 238,
+    "tags": [
+      "pop",
+      "hip hop",
+      "ballad"
+    ]
+  },
+  {
+    "video_id": "OPf0YbXqDm0",
+    "title": "Uptown Funk",
+    "artist": "Mark Ronson ft. Bruno Mars",
+    "stream_url": "/api/file/OPf0YbXqDm0",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/OPf0YbXqDm0/hqdefault.jpg",
+    "duration_seconds": 271,
+    "tags": [
+      "pop",
+      "funk",
+      "dance"
+    ]
+  },
+  {
+    "video_id": "TUVcZfQe-Kw",
+    "title": "Levitating",
+    "artist": "Dua Lipa",
+    "stream_url": "/api/file/TUVcZfQe-Kw",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/TUVcZfQe-Kw/hqdefault.jpg",
+    "duration_seconds": 231,
+    "tags": [
+      "pop",
+      "dance",
+      "disco"
+    ]
+  },
+  {
+    "video_id": "H5v3kku4y6Q",
+    "title": "As It Was",
+    "artist": "Harry Styles",
+    "stream_url": "/api/file/H5v3kku4y6Q",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/H5v3kku4y6Q/hqdefault.jpg",
+    "duration_seconds": 166,
+    "tags": [
+      "pop",
+      "2020s",
+      "synthpop"
+    ]
+  },
+  {
+    "video_id": "b1kbLwvqugk",
+    "title": "Anti-Hero",
+    "artist": "Taylor Swift",
+    "stream_url": "/api/file/b1kbLwvqugk",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/b1kbLwvqugk/hqdefault.jpg",
+    "duration_seconds": 310,
+    "tags": [
+      "pop",
+      "2020s",
+      "indie pop"
+    ]
+  },
+  {
+    "video_id": "G7KNmW9a75Y",
+    "title": "Flowers",
+    "artist": "Miley Cyrus",
+    "stream_url": "/api/file/G7KNmW9a75Y",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/G7KNmW9a75Y/hqdefault.jpg",
+    "duration_seconds": 202,
+    "tags": [
+      "pop",
+      "2020s",
+      "disco pop"
+    ]
+  },
+  {
+    "video_id": "DyDfgMOUjCI",
+    "title": "bad guy",
+    "artist": "Billie Eilish",
+    "stream_url": "/api/file/DyDfgMOUjCI",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/DyDfgMOUjCI/hqdefault.jpg",
+    "duration_seconds": 206,
+    "tags": [
+      "pop",
+      "electropop",
+      "2010s"
+    ]
+  },
+  {
+    "video_id": "hLQl3WQQoQ0",
+    "title": "Someone Like You",
+    "artist": "Adele",
+    "stream_url": "/api/file/hLQl3WQQoQ0",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/hLQl3WQQoQ0/hqdefault.jpg",
+    "duration_seconds": 285,
+    "tags": [
+      "pop",
+      "soul",
+      "ballad",
+      "piano"
+    ]
+  },
+  {
+    "video_id": "rYEDA3JcQqw",
+    "title": "Rolling in the Deep",
+    "artist": "Adele",
+    "stream_url": "/api/file/rYEDA3JcQqw",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/rYEDA3JcQqw/hqdefault.jpg",
+    "duration_seconds": 234,
+    "tags": [
+      "pop",
+      "soul",
+      "blues"
+    ]
+  },
+  {
+    "video_id": "djV11Xbc914",
+    "title": "Take On Me",
+    "artist": "a-ha",
+    "stream_url": "/api/file/djV11Xbc914",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/djV11Xbc914/hqdefault.jpg",
+    "duration_seconds": 244,
+    "tags": [
+      "pop",
+      "80s",
+      "synthpop"
+    ]
+  },
+  {
+    "video_id": "FTQbiNvZqaY",
+    "title": "Africa",
+    "artist": "Toto",
+    "stream_url": "/api/file/FTQbiNvZqaY",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/FTQbiNvZqaY/hqdefault.jpg",
+    "duration_seconds": 272,
+    "tags": [
+      "rock",
+      "soft rock",
+      "80s"
+    ]
+  },
+  {
+    "video_id": "1w7OgIMMRc4",
+    "title": "Sweet Child O' Mine",
+    "artist": "Guns N' Roses",
+    "stream_url": "/api/file/1w7OgIMMRc4",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/1w7OgIMMRc4/hqdefault.jpg",
+    "duration_seconds": 303,
+    "tags": [
+      "rock",
+      "hard rock",
+      "80s"
+    ]
+  },
+  {
+    "video_id": "09839DpTctU",
+    "title": "Hotel California",
+    "artist": "Eagles",
+    "stream_url": "/api/file/09839DpTctU",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/09839DpTctU/hqdefault.jpg",
+    "duration_seconds": 405,
+    "tags": [
+      "rock",
+      "classic rock",
+      "70s"
+    ]
+  },
+  {
+    "video_id": "YkgkThdzX-8",
+    "title": "Imagine",
+    "artist": "John Lennon",
+    "stream_url": "/api/file/YkgkThdzX-8",
+    "source": "youtube",
+    "thumbnail": "https://i.ytimg.com/vi/YkgkThdzX-8/hqdefault.jpg",
+    "duration_seconds": 234,
+    "tags": [
+      "pop",
+      "soft rock",
+      "70s",
+      "piano"
+    ]
+  },
+  {
+    "video_id": "iotademo001",
+    "title": "Neon Drift",
+    "artist": "Iota Ensemble",
+    "stream_url": "/api/file/iotademo001",
+    "source": "iota_cloud",
+    "thumbnail": "/static/thumbs/default.svg",
+    "duration_seconds": 0,
+    "tags": [
+      "demo",
+      "electronic",
+      "synthetic"
+    ]
+  },
+  {
+    "video_id": "iotademo002",
+    "title": "Circuit Bloom",
+    "artist": "Iota Ensemble",
+    "stream_url": "/api/file/iotademo002",
+    "source": "iota_cloud",
+    "thumbnail": "/static/thumbs/default.svg",
+    "duration_seconds": 0,
+    "tags": [
+      "demo",
+      "ambient",
+      "synthetic"
+    ]
+  }
+]
