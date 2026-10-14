@@ -1,6 +1,7 @@
 """Public Iota songs catalog: search, lookup, random, suggest, file stream."""
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
@@ -19,11 +20,14 @@ from app.services.media_provider import (
     ProviderUnavailableError,
 )
 from app.services.stream_proxy import StreamProxy
+from app.utils.telemetry import telemetry
 
 router = APIRouter()
 API_VERSION = "2.0.0"
-PUBLIC_RPM = 60
-ip_limiter = IpSlidingWindow(PUBLIC_RPM)
+# Public per-IP rate limit. 0 disables the limit entirely (unlimited);
+# override with IOTA_PUBLIC_RPM=<requests per minute> to re-enable.
+PUBLIC_RPM = int(os.environ.get("IOTA_PUBLIC_RPM", "0"))
+ip_limiter = IpSlidingWindow(PUBLIC_RPM) if PUBLIC_RPM > 0 else None
 
 
 def _index(request: Request) -> SongIndex:
@@ -35,7 +39,8 @@ def _index(request: Request) -> SongIndex:
 
 
 def _guard(request: Request) -> None:
-    ip_limiter.check(request)
+    if ip_limiter is not None:
+        ip_limiter.check(request)
 
 
 @router.get("/api/search")
@@ -138,6 +143,26 @@ async def api_catalog_stats(request: Request):
     }
 
 
+@router.get("/api/status")
+@router.get("/api/stats/live")
+async def api_live_stats(request: Request):
+    """Live usage telemetry for the /status page: streams, downloads,
+    searches, latency percentiles, per-provider health, top tracks and a
+    rolling event feed. Counters are public-safe — no keys, no exact
+    client addresses are exposed."""
+    from app.config import get_settings
+
+    snap = telemetry.snapshot()
+    snap.update({
+        "success": True,
+        "version": API_VERSION,
+        "rate_limit_per_minute": PUBLIC_RPM,
+        "catalog_total": _index(request).stats().get("total_songs", 0),
+        "redis": get_settings().redis_disabled is False,
+    })
+    return snap
+
+
 @router.get("/api")
 async def api_root():
     return {
@@ -179,7 +204,10 @@ async def api_file(
     # provider (YouTube). Demo tracks keep the synthetic WAV so the
     # catalog stays playable even with no upstream access.
     if song.get("source") == "youtube":
-        return await _proxy_real_audio(video_id, range_header, stream_proxy, provider)
+        return await _proxy_real_audio(
+            video_id, range_header, stream_proxy, provider,
+            client_ip=request.client.host if request.client else None,
+        )
     return _demo_wav_response(video_id, range_header)
 
 
@@ -214,6 +242,7 @@ async def _proxy_real_audio(
     range_header: Optional[str],
     stream_proxy: StreamProxy,
     provider: MediaProvider,
+    client_ip: Optional[str] = None,
 ) -> StreamingResponse:
     """Stream real audio for a catalog track via the provider.
 
@@ -222,6 +251,9 @@ async def _proxy_real_audio(
     provider resolves the YouTube id to a CDN URL and the stream
     proxy relays the bytes with HTTP Range support.
     """
+    import time as _time
+
+    _setup_started = _time.perf_counter()
     media_id = f"yt:{video_id}"
     try:
         src = await provider.get_stream_by_type(media_id, "audio")
@@ -266,8 +298,15 @@ async def _proxy_real_audio(
     chunk_size = settings.stream_chunk_size
     workers = settings.stream_parallel_workers
     direct_url = src.direct_url
+    telemetry.record_latency(
+        (_time.perf_counter() - _setup_started) * 1000, provider="YouTube"
+    )
+    telemetry.record_stream_start(
+        media_id, title=video_id, provider="yt", client_ip=client_ip
+    )
 
     async def body():
+        sent = 0
         if workers > 1:
             stream_iter = stream_proxy.stream_parallel(
                 direct_url, start=start, end=end,
@@ -277,7 +316,11 @@ async def _proxy_real_audio(
             stream_iter = stream_proxy.stream(
                 direct_url, start=start, end=end, chunk_size=chunk_size,
             )
-        async for chunk in stream_iter:
-            yield chunk
+        try:
+            async for chunk in stream_iter:
+                sent += len(chunk)
+                yield chunk
+        finally:
+            telemetry.record_stream_bytes(media_id, sent, provider="yt")
 
     return StreamingResponse(body(), status_code=status_code, headers=headers, media_type=mime_type)

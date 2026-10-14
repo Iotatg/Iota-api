@@ -388,6 +388,23 @@ For production, at minimum:
 
 The app is stateless (all state is in Postgres + Redis + storage). Scale horizontally by adding more Uvicorn workers / more containers. No sticky sessions needed.
 
+### Railway (free plan) deployment notes
+
+Verified working recipe (project `iota`, service `iota-api`):
+
+1. **Builder must be NIXPACKS.** New services default to a builder that ignores `nixpacks.toml`; set it via GraphQL `serviceInstanceUpdate` (`input.builder = NIXPACKS`, plus `startCommand`).
+2. **`nixpacks.toml` keep nixPkgs slim**: `["python312", "ffmpeg", "nodejs_20", "deno", "curl"]`. Adding `cacert`/`gcc` triggers an nix profile conflict and the build fails.
+3. The Nixpacks image puts the venv at `/opt/venv` (not `/code/.venv`); reference it in health checks / shell probes.
+4. **CLI auth**: account-scoped UUID tokens only work via `RAILWAY_API_TOKEN` (not `RAILWAY_TOKEN`, which expects project tokens).
+5. **Ephemeral storage**: `DATABASE_URL=sqlite+aiosqlite:////tmp/iota.db` — every redeploy/restart wipes API keys. After each deploy, re-mint one:
+   ```bash
+   curl -X POST "$URL/admin/keys" -H "X-Admin-Token: $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"name":"bot"}'
+   ```
+   (`X-Admin-Token` header, not Bearer.) Then update the consumer's `.env`. Attach a Railway volume if you want keys to survive redeploys.
+6. **Region switching and IPv6 egress are not available on the free plan.** `serviceInstanceUpdate` reports success but the instance keeps the same egress datacenter/IP.
+7. **YouTube on datacenter IPs**: the web player client is served an attestation wall ("The page needs to be reloaded" / "Sign in to confirm"). The provider automatically retries with `--extractor-args youtube:player_client=android -4` and strips `--cookies` for that retry (cookies make android-client responses worse). That fallback caps quality at 360p muxed until trusted (age-verified) cookies are supplied via `YOUTUBE_COOKIES_CONTENT`. Installing `yt-dlp-ejs` + deno/node runtimes does not lift the block on flagged IPs.
+
 ---
 
 ## 13. Plugging in a real provider
@@ -490,6 +507,8 @@ client often still answers while the web client is walled.
 `YOUTUBE_BREAKER_COOLDOWN_SECONDS` (default 1800) trip a circuit
 breaker after repeated IP-level bot checks so the primary path
 fast-fails instead of hammering a flagged IP; a success resets it.
+A historical audit of (now removed) third-party audio APIs is kept in
+[`docs/THIRD_PARTY_APIS.md`](docs/THIRD_PARTY_APIS.md) for reference.
 
 API keys carry **no limits by default** (`0 = unlimited`; still set
 per-key values via the admin API when you need them).

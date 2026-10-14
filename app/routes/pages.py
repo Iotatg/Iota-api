@@ -4,14 +4,38 @@ from __future__ import annotations
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
-from app.pages import db_dashboard_html, docs_html, landing_html, privacy_html, terms_html
+from app.appsite import app_shell_html
+from app.pages import (
+    about_html,
+    db_dashboard_html,
+    docs_html,
+    landing_html,
+    privacy_html,
+    stats_page_html,
+    terms_html,
+)
 
 router = APIRouter()
 
 
 @router.get("/", include_in_schema=False)
+async def app_home():
+    return HTMLResponse(app_shell_html())
+
+
+@router.get("/dev", include_in_schema=False)
 async def landing():
     return HTMLResponse(landing_html())
+
+
+@router.get("/about", include_in_schema=False)
+async def about():
+    return HTMLResponse(about_html())
+
+
+@router.get("/status", include_in_schema=False)
+async def status_page():
+    return HTMLResponse(stats_page_html())
 
 
 @router.get("/docs", include_in_schema=False)

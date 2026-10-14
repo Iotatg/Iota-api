@@ -19,6 +19,8 @@ route returns a structured 502/503.
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
+import os
 import re
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional, Tuple
@@ -58,21 +60,52 @@ class UpstreamHead:
     supports_range: bool = True
 
 
+def _load_cookie_jar(cookies_file: Optional[str]) -> Optional[http.cookiejar.CookieJar]:
+    """Load a Netscape cookie file for upstream media requests.
+
+    googlevideo URLs minted from a signed-in session can be rejected
+    with HTTP 403 when the fetch carries no session cookies, so the
+    same cookie file yt-dlp uses for extraction is attached here.
+    Expired cookies are ignored on load: YouTube rotates them often
+    and a half-stale jar still passes the CDN check.
+    """
+    if not cookies_file or not os.path.isfile(cookies_file):
+        return None
+    jar = http.cookiejar.MozillaCookieJar(cookies_file)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except (OSError, http.cookiejar.LoadError) as exc:
+        logger.warning("upstream_cookies_load_failed", extra={"err": str(exc)})
+        return None
+    if not jar:
+        return None
+    return jar
+
+
 class StreamProxy:
     """Range-aware HTTP proxy for remote media bytes."""
 
-    def __init__(self, client: Optional[httpx.AsyncClient] = None) -> None:
+    def __init__(
+        self,
+        client: Optional[httpx.AsyncClient] = None,
+        cookies_file: Optional[str] = None,
+    ) -> None:
         self._client = client
         self._owns_client = client is None
+        self._cookies_file = cookies_file
+        self._cookie_jar: Optional[http.cookiejar.CookieJar] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             timeout = httpx.Timeout(
                 connect=_CONNECT_TIMEOUT, read=_READ_TIMEOUT, write=10.0, pool=10.0
             )
+            if self._cookies_file and self._cookie_jar is None:
+                self._cookie_jar = _load_cookie_jar(self._cookies_file)
             self._client = httpx.AsyncClient(
                 timeout=timeout,
                 follow_redirects=True,
+                cookies=self._cookie_jar,
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

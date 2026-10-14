@@ -11,10 +11,11 @@ Wires together:
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 import redis.asyncio as redis
 from fastapi import FastAPI, Request
@@ -32,7 +33,7 @@ from pathlib import Path
 from app.catalog.index import SongIndex
 from fastapi.staticfiles import StaticFiles
 
-from app.routes import admin, agent, catalog, discovery, download, health, info, iotadb, library, pages, search, stats, stream
+from app.routes import admin, agent, catalog, discovery, download, health, info, iotadb, library, live, pages, search, stats, stream
 from app.services.apple_music_provider import AppleMusicProvider
 from app.services.boomplay_provider import BoomplayProvider
 from app.services.demo_provider import DemoProvider
@@ -52,6 +53,26 @@ from app.utils.metrics import api_requests_total
 from app.utils.rate_limit import RateLimiter
 
 logger = get_logger(__name__)
+
+
+def _resolve_youtube_cookies_file(settings) -> Optional[str]:
+    """Return the YouTube cookies file path for upstream fetches.
+
+    ``YOUTUBE_COOKIES_CONTENT`` (inline cookie text, used on hosts
+    like Railway where shipping a file is awkward) is materialized
+    to the same temp path the YouTubeProvider writes, so both the
+    extractor and the stream proxy read one file per process.
+    """
+    if settings.youtube_cookies_content:
+        path = os.path.join(tempfile.gettempdir(), "iotatg_yt_cookies.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(settings.youtube_cookies_content)
+            os.chmod(path, 0o600)
+            return path
+        except OSError as exc:
+            logger.warning("youtube_cookies_content_write_failed", extra={"err": str(exc)})
+    return settings.youtube_cookies_file
 
 # Route groups that live under /api/v1 (library, iotadb). A
 # /v1/<group>/... request is aliased to /api/v1/<group>/...
@@ -181,8 +202,13 @@ async def lifespan(app: FastAPI):
     catalog_path = Path(__file__).resolve().parent.parent / "data" / "songs.json"
     song_index = SongIndex.from_json_path(catalog_path)
 
-    # Stream proxy for remote direct_url sources
-    stream_proxy = StreamProxy()
+    # Stream proxy for remote direct_url sources. The upstream (YouTube
+    # CDN) can reject session-minted URLs with 403 unless the fetch
+    # carries the same cookies yt-dlp used for extraction, so resolve
+    # the cookie source once here and hand it to the proxy.
+    stream_proxy = StreamProxy(
+        cookies_file=_resolve_youtube_cookies_file(settings)
+    )
 
     # Caches
     l1 = MemoryCache(max_size=settings.metadata_cache_max_size,
@@ -346,6 +372,7 @@ def create_app() -> FastAPI:
     app.include_router(iotadb.router, tags=["iotadb"])
     app.include_router(health.router, tags=["health"])
     app.include_router(stream.router, tags=["stream"])
+    app.include_router(live.router, tags=["live"])
     app.include_router(download.router, tags=["download"])
     app.include_router(info.router, tags=["info"])
     app.include_router(search.router, tags=["search"])

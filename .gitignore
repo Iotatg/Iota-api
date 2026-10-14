@@ -57,3 +57,9 @@ downloads/
 
 # runtime mirror index (self-heal cache)
 data/mirror_index.json
+
+# YouTube session cookies for yt-dlp extraction (never commit)
+cookies.txt
+cookies*.txt
+
+.data/

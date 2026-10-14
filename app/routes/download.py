@@ -21,8 +21,10 @@ import asyncio
 import contextlib
 import os
 import re
+import shutil
 import tempfile
 import time
+from pathlib import Path
 from typing import AsyncIterator, Optional, Tuple
 from urllib.parse import quote
 
@@ -58,6 +60,7 @@ from app.utils.metrics import (
     stream_bytes_total,
 )
 from app.utils.rate_limit import RateLimiter
+from app.utils.telemetry import telemetry, provider_of
 
 from app.routes.stream import _parse_range
 
@@ -233,6 +236,66 @@ async def _temp_file_stream(
                 break
             remaining -= len(chunk)
             yield chunk
+
+
+# ── Merged DASH video cache ──────────────────────────────────────
+# A DASH merge costs 100-500 MB of upstream fetching per request;
+# without a cache, one slow client download makes voice-chat bots
+# retry the identical merge in a loop. Cache results on disk keyed
+# by media id + height cap and serve repeats instantly.
+
+def _merge_cache_path(settings, media_id: str, max_height: Optional[int]) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.:-]", "_", media_id)
+    height = (max_height or settings.video_max_height_cap) // 72 * 72
+    return Path(settings.video_merge_cache_dir) / f"{safe}.{height}.mp4"
+
+
+def _stash_merge_cache(settings, cache_path: Path, merged_tmp: str) -> None:
+    """Move a freshly merged temp file into the cache (best effort).
+
+    Skips if another request already cached the same key; trims
+    the cache directory to its size budget once stored."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            return
+        tmp_stash = str(cache_path) + f".part{os.getpid()}.{time.time_ns()}"
+        os.replace(merged_tmp, tmp_stash)
+        os.replace(tmp_stash, cache_path)
+        _trim_merge_cache(settings)
+    except OSError:
+        with contextlib.suppress(OSError):
+            Path(str(cache_path) + f".part{os.getpid()}").unlink(missing_ok=True)
+
+
+def _trim_merge_cache(settings) -> None:
+    """Keep the merge cache dir under its byte budget, deleting
+    oldest files first but never files younger than the live-serve
+    window (a response may still be streaming from one)."""
+    cache_dir = Path(settings.video_merge_cache_dir)
+    budget = max(64, settings.video_merge_cache_max_mb) * 1024 * 1024
+    try:
+        entries = [p for p in cache_dir.glob("*.mp4") if p.is_file()]
+        sized = [(p.stat().st_mtime, p.stat().st_size, p) for p in entries]
+    except OSError:
+        return
+    total = sum(sz for _, sz, _ in sized)
+    if total <= budget:
+        return
+    fresh = time.time() - 900
+    for _, sz, p in sorted(sized, reverse=True):
+        if total <= budget:
+            break
+        try:
+            if p.stat().st_mtime >= fresh:
+                continue
+        except OSError:
+            continue
+        try:
+            p.unlink()
+            total -= sz
+        except OSError:
+            break
 
 
 async def _invalidate_upstream(provider: MediaProvider, media_id: str) -> None:
@@ -540,6 +603,14 @@ async def _do_download(
             "detail": str(e),
         })
 
+    # ── 2a. Telemetry: a successful download request ─────────────
+    telemetry.record_download(
+        media_id,
+        title=await _title_for(provider, media_id),
+        provider=provider_of(media_id),
+        size_bytes=src.size_bytes or 0,
+    )
+
     # ── 2b. MP3 transcode (download-only, on-the-fly) ──────
     if format_param == "mp3" and kind == "audio" and src.direct_url:
         return await _serve_mp3(
@@ -548,16 +619,37 @@ async def _do_download(
             src=src, method=method, started=started,
         )
 
+    # ── 2c. Video height clamp ──────────────────────────────────────
+    # 1080p DASH fetches regularly exceed 400 MB for a single song
+    # video; voice-chat clients never benefit from that. Clamp every
+    # request (explicit or default) to the configured cap.
+    if kind == "video":
+        cap = settings.video_max_height_cap
+        max_height = min(max_height, cap) if max_height else cap
+
     # ── 3. Resolve size + decide storage vs proxy vs dash path ──────
     dash_tmp_path: Optional[str] = None
+    delete_dash_after = False
+    merge_cache_path: Optional[Path] = None
     if src.is_dash and src.direct_url and src.direct_url_audio:
         # High-quality video: two DASH streams that must be
-        # remuxed together. For GET we merge them into a temp
-        # file with ffmpeg and serve it Range-capable; for HEAD
-        # we approximate the size as the sum of the two streams
-        # so a probe never triggers a full merge.
+        # remuxed together. A prior merge may be cached on disk —
+        # serve it directly and skip the multi-minute refetch.
+        # Without a cache hit, for GET we merge the streams into a
+        # temp file with ffmpeg and serve it Range-capable; for
+        # HEAD we approximate the size as the sum of the two
+        # streams so a probe never triggers a full merge.
         mime_type = "video/mp4"
-        if method == "HEAD":
+        merge_cache_path = _merge_cache_path(settings, media_id, max_height)
+        if (
+            merge_cache_path.is_file()
+            and merge_cache_path.stat().st_size > 100_000
+        ):
+            dash_tmp_path = str(merge_cache_path)
+            size = merge_cache_path.stat().st_size
+            stream_kind = "dash_cache"
+            stream_target = dash_tmp_path
+        elif method == "HEAD":
             try:
                 vhead = await stream_proxy.head(src.direct_url)
                 ahead = await stream_proxy.head(src.direct_url_audio)
@@ -582,8 +674,16 @@ async def _do_download(
                     "error": "upstream_unavailable",
                     "detail": str(e),
                 })
+            _stash_merge_cache(settings, merge_cache_path, dash_tmp_path)
+            if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
+                # Cache now owns the merged bytes; serve from the
+                # cached copy so later requests reuse it too.
+                dash_tmp_path = str(merge_cache_path)
+                stream_kind = "dash_cache"
+            else:
+                stream_kind = "dash_temp"
+                delete_dash_after = True
             size = os.path.getsize(dash_tmp_path)
-            stream_kind = "dash_temp"
             stream_target = dash_tmp_path
     elif src.direct_url:
         try:
@@ -682,7 +782,7 @@ async def _do_download(
         tee = bytearray() if mirrorable else None
         completed = False
         try:
-            if stream_kind == "dash_temp":
+            if stream_kind in ("dash_temp", "dash_cache"):
                 async for chunk in _temp_file_stream(
                     stream_target, start, end, chunk_size
                 ):
@@ -734,8 +834,9 @@ async def _do_download(
             except Exception:
                 await session.rollback()
             # DASH video is merged into a temp file; remove it
-            # now that the response has been fully streamed.
-            if dash_tmp_path:
+            # now that the response has been fully streamed. Files
+            # served from the merge cache must survive for reuse.
+            if dash_tmp_path and delete_dash_after:
                 with contextlib.suppress(OSError):
                     os.unlink(dash_tmp_path)
             logger.info("download_complete", extra={

@@ -442,8 +442,8 @@ class YouTubeProvider(MediaProvider):
         self.api_key = api_key
         self.proxy = proxy
         self._ytdlp_argv = ytdlp_path.split() if ytdlp_path else _resolve_ytdlp_argv()
-        # If cookies_content is provided (e.g. from an env var, where
-        # uploading a file is awkward), materialize it
+        # If cookies_content is provided (e.g. from an env var on a host
+        # like Railway where uploading a file is awkward), materialize it
         # to a temp file at provider construction. The file lives in the
         # container's ephemeral filesystem and is recreated on every
         # restart; this avoids committing cookies to the image.
@@ -844,7 +844,7 @@ class YouTubeProvider(MediaProvider):
                 "title": obj.get("title") or "",
                 "channel": obj.get("channel") or obj.get("uploader") or "",
                 "duration": obj.get("duration"),
-                "thumbnail": obj.get("thumbnail") or "",
+                "thumbnail": _thumbnail(obj),
                 "view_count": obj.get("view_count"),
             })
         return out
@@ -1099,7 +1099,7 @@ class YouTubeProvider(MediaProvider):
                 title=str(obj.get("title") or vid),
                 artist=str(obj.get("channel") or obj.get("uploader") or "") or None,
                 duration_seconds=_parse_duration_seconds(obj.get("duration")),
-                thumbnail_url=obj.get("thumbnail") or None,
+                thumbnail_url=_thumbnail(obj) or None,
                 mime_type="audio/mpeg",
                 provider="yt",
                 views=_stat(obj, "view_count"),

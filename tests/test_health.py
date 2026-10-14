@@ -3,8 +3,17 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_root_returns_player_html(client):
+async def test_root_returns_app_shell(client):
     r = await client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "IOTA AUDIO" in r.text
+    assert "/static/app.js" in r.text
+
+
+@pytest.mark.asyncio
+async def test_dev_returns_player_html(client):
+    r = await client.get("/dev")
     assert r.status_code == 200
     assert "text/html" in r.headers.get("content-type", "")
     assert "Iota Songs API" in r.text

@@ -109,6 +109,20 @@ class Settings(BaseSettings):
     # the URL and invalidates on failure).
     stream_cache_persistent_ttl: int = 3600
 
+    # ── Download video pipeline ───────────────────────────────────────────
+    # DASH video merges (kind=video downloads) are expensive: both
+    # streams are fully fetched upstream before an ffmpeg remux. A
+    # disk cache of merged results keyed by media id + height cap
+    # makes repeat downloads instant and stops bot retry loops from
+    # re-triggering the multi-minute fetch.
+    video_merge_cache_dir: str = ".data/merge-cache"
+    # Budget for the merged-video cache directory in megabytes.
+    video_merge_cache_max_mb: int = 1024
+    # Hard cap on requested video heights (1080p fetches are far too
+    # large for voice-chat previews; 720p keeps quality while cutting
+    # size and fetch time roughly in half).
+    video_max_height_cap: int = 720
+
     # ── Demo provider ─────────────────────────────────────────────────────
     demo_audio_dir: str = "./storage/audio"
 
@@ -132,9 +146,14 @@ class Settings(BaseSettings):
     spotify_client_secret: Optional[str] = None
     jiosaavn_api_key: Optional[str] = None
     soundcloud_api_key: Optional[str] = None
+    # Third-party *feature clients* (not providers — never routable as
+    # prefixes; see docs/THIRD_PARTY_APIS.md). Optional. Nubcoder:
+    # view-count metadata, autocomplete and Range-capable relay URLs
+    # from an independent egress. Yuki: lyrics + pre-encoded complete
+    # MP3 tiers. Used only where/if our own sources fall short.
     # YouTube circuit breaker: after this many consecutive bot-check /
     # 429 failures, YouTube calls fast-fail for the cooldown window so
-    # other sources can serve the request instead of hammering a
+    # requests fall through to Yuki/Nubcoder instead of hammering a
     # flagged IP (which prolongs the block). 0 disables the breaker.
     youtube_breaker_threshold: int = 3
     youtube_breaker_cooldown_seconds: int = 1800

@@ -114,6 +114,21 @@ class ProviderRegistry(MediaProvider):
             native_id, media_type, prefer_dash, max_height
         )
 
+    async def invalidate_stream(self, media_id: str) -> None:
+        """Drop a cached stream URL in the child provider.
+
+        Upstream URLs can be revoked before their TTL, and the routes
+        drop them on failure so the next request re-resolves. Without
+        this delegation the routes' getattr found no method on the
+        registry, so a poisoned URL stayed cached for its full TTL
+        and every request kept replaying it. Accepts the prefixed id
+        (the child providers strip their own prefix).
+        """
+        provider, _native_id = self.resolve(media_id)
+        invalidate = getattr(provider, "invalidate_stream", None)
+        if callable(invalidate):
+            await invalidate(media_id)
+
     async def search(self, query: str, limit: int = 20) -> List[MediaMetadata]:
         """Fan out to every enabled provider, dedup by canonical media_id."""
         if not query or not query.strip():
