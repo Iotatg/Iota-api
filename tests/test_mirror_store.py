@@ -162,6 +162,8 @@ async def test_relay_tier_prefers_mirror_over_catalog(monkeypatch):
     monkeypatch.setattr("app.services.stream_fallback._cached_source", fake_cached)
     assert await relay_source("prov", "AAAAAAAAAAA", "audio") == "CATALOG"
     monkeypatch.undo()
+    # the mirror is opt-in, undo() also dropped the env var of the fixture
+    monkeypatch.setenv("IOTA_MIRROR", "1")
     _seed()
     hit = await relay_source("prov", "AAAAAAAAAAA", "audio")
     assert hit.direct_url == "https://litter.catbox.moe/q3fge5.mp3"

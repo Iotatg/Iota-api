@@ -8,8 +8,7 @@ Keys are looked up by SHA-256 hash, not by plaintext.
 """
 from __future__ import annotations
 
-import hmac
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -70,16 +69,11 @@ async def require_api_key(
             },
         )
 
-    if not raw.startswith(settings.api_key_prefix):
-        # Constant-time compare: do not leak prefix info via timing
-        hmac.compare_digest(raw, raw)  # noqa: F841
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "invalid_api_key", "detail": "API key format invalid."},
-        )
-
     api_key = await lookup_key(raw, session)
-    if api_key is None:
+    if api_key is None or not raw.startswith(settings.api_key_prefix):
+        # The lookup always runs, so a malformed key costs the same time as an
+        # unknown one. Both answers are identical, the format of a key is not
+        # leaked through the answer or through the answer time.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "invalid_api_key", "detail": "API key not recognised."},
@@ -96,4 +90,4 @@ async def require_api_key(
 
 def touch(api_key: APIKey) -> None:
     """Update last_used_at to now. Caller is responsible for committing."""
-    api_key.last_used_at = datetime.utcnow()
+    api_key.last_used_at = datetime.now(timezone.utc)

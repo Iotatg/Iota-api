@@ -70,3 +70,28 @@ provider_errors_total = Counter(
 def render_metrics() -> tuple[bytes, str]:
     """Return (body, content_type) for the /metrics endpoint."""
     return generate_latest(REGISTRY), CONTENT_TYPE_LATEST
+
+
+def sample_sum(name: str) -> float:
+    """Sum every sample of a metric, no matter which labels it carries."""
+    total = 0.0
+    for metric in REGISTRY.collect():
+        for sample in metric.samples:
+            if sample.name == name:
+                total += sample.value
+    return total
+
+
+def cache_hit_rate() -> float:
+    """Share of the cache lookups that were answered from the cache."""
+    hits = sample_sum("cache_hits_total")
+    misses = sample_sum("cache_misses_total")
+    total = hits + misses
+    if total <= 0:
+        return 0.0
+    return hits / total
+
+
+def active_stream_count() -> int:
+    """Number of streams that are currently running."""
+    return int(sample_sum("active_streams"))

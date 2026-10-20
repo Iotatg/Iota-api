@@ -22,6 +22,7 @@ from app.models.api_key import APIKey, APIKeyTier
 from app.schemas.api_key import APIKeyCreateRequest, APIKeyCreateResponse, APIKeyView
 from app.schemas.stats import APIKeyStats, GlobalStats
 from app.utils.logging import get_logger
+from app.utils.metrics import active_stream_count, cache_hit_rate, sample_sum
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -141,7 +142,7 @@ async def global_stats(
         requests_today=int(requests_today or 0),
         total_requests=int(total_requests or 0),
         bytes_streamed=int(bytes_streamed or 0),
-        cache_hit_rate=0.0,  # aggregated from metrics
-        provider_errors=0,   # aggregated from metrics
-        active_streams=0,    # aggregated from metrics
+        cache_hit_rate=round(cache_hit_rate(), 4),
+        provider_errors=int(sample_sum("provider_errors_total")),
+        active_streams=active_stream_count(),
     )

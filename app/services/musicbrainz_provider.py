@@ -10,7 +10,7 @@ contact information: https://musicbrainz.org/doc/XMLWebService
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 

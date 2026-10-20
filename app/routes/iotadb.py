@@ -29,6 +29,12 @@ async def get_ctx(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     authorization: Optional[str] = Header(None),
 ):
+    """Resolve the tenant of a request.
+
+    Every route needs a key. The public sandbox is only reachable through the
+    anonymous key endpoint, which mints a key for the sandbox tenant. Without
+    a key no document of any tenant can be read or written.
+    """
     engine = IotaDBEngine(session)
     raw = x_api_key
     if not raw and authorization:
@@ -38,8 +44,14 @@ async def get_ctx(
         if not key:
             raise HTTPException(status_code=401, detail={"error": "invalid_api_key", "detail": "IotaDB key rejected."})
         return {"user_id": key["user_id"], "engine": engine, "auth": "api_key"}
-    await engine.ensure_tenant(SANDBOX_USER, "sandbox")
-    return {"user_id": SANDBOX_USER, "engine": engine, "auth": "sandbox"}
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "error": "missing_api_key",
+            "detail": "Provide an IotaDB key via the X-API-Key header or Authorization: Bearer. "
+                      "A sandbox key is minted with POST /api/v1/keys/anonymous.",
+        },
+    )
 
 
 def _storage(request: Request) -> StorageService:

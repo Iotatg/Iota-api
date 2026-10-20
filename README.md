@@ -237,6 +237,27 @@ When a limit is hit, the response is `429 Too Many Requests` with the structured
 
 Single env var, `ADMIN_TOKEN`. Used for all `/admin/*` routes via the `X-Admin-Token` header. Comparison is constant-time. The token is never logged. In production, restrict `/admin/*` to an internal network (see `nginx.conf`).
 
+### Sandbox key (public demo)
+
+The `/api/v1/db/*` routes are document storage and always need a key, there is no anonymous fallback. For the public demo a throwaway sandbox key can be minted without an admin token:
+
+```bash
+# Mint a sandbox key
+curl -X POST http://localhost/api/v1/keys/anonymous
+
+# Use it
+curl http://localhost/api/v1/db/documents \
+  -H "X-API-Key: iota_..."
+```
+
+Sandbox keys are rate limited like any other key and their documents are removed with the sandbox.
+
+The sandbox key belongs to the document store only. The media endpoints (`/search`, `/info`, `/stream`) read the `api_keys` table, so they need a key that was created through the admin API.
+
+### Media mirror (opt-in)
+
+`IOTA_MIRROR=1` uploads every already delivered YouTube track to the litterbox file host and serves later requests from that mirror. It is off by default because it ships user traffic to a third-party host.
+
 ---
 
 ## 8. Demo provider and storage

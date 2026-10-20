@@ -2,14 +2,17 @@
 
 GET /lyrics/{media_id}          -> LRC payload for any provider's track
 GET /similar/{media_id}         -> related tracks (Deezer similarity)
-GET /charts /radios /genres     -> Deezer catalogue browse (key-less)
+GET /charts /radios /genres     -> Deezer catalogue browse (key required)
 GET /artists/{name} /albums/{id}-> artist discography / album tracklist
 GET /entity?kind=...            -> playlist/album/artist/radio search
 GET /playlists/{id}             -> YouTube PL, or Deezer PL via dz: prefix
-GET /transcript/{media_id}      -> YouTube captions (yt-dlp, key-less)
+GET /transcript/{media_id}      -> YouTube captions (yt-dlp, key required)
 
 Metadata endpoints resolve the track's metadata through the provider
 registry first, so provider-neutral ids (yt:, dz:, sp:, am:, ...) all work.
+
+Every route below needs an API key, use ``POST /api/v1/keys/anonymous``
+to mint a sandbox key for the public demo.
 """
 from __future__ import annotations
 

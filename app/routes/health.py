@@ -62,7 +62,7 @@ async def health(
     else:
         checks["redis"] = "disabled"
 
-    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+    overall = "ok" if all(v in ("ok", "disabled") for v in checks.values()) else "degraded"
     return {
         "status": overall,
         "service": settings.app_name,

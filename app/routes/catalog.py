@@ -9,7 +9,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from app.catalog.audio import demo_wav_bytes
 from app.catalog.index import SongIndex
-from app.catalog.ip_limit import IpSlidingWindow
+from app.catalog.ip_limit import public_limiter
 from app.config import get_settings
 from app.dependencies import get_provider, get_stream_proxy
 from app.routes.stream import _parse_range
@@ -25,9 +25,9 @@ from app.utils.telemetry import telemetry
 router = APIRouter()
 API_VERSION = "2.0.0"
 # Public per-IP rate limit. 0 disables the limit entirely (unlimited);
-# override with IOTA_PUBLIC_RPM=<requests per minute> to re-enable.
+# override with IOTA_PUBLIC_RPM=<requests per minute> to re-enable. Every
+# public route shares one limiter.
 PUBLIC_RPM = int(os.environ.get("IOTA_PUBLIC_RPM", "0"))
-ip_limiter = IpSlidingWindow(PUBLIC_RPM) if PUBLIC_RPM > 0 else None
 
 
 def _index(request: Request) -> SongIndex:
@@ -39,8 +39,9 @@ def _index(request: Request) -> SongIndex:
 
 
 def _guard(request: Request) -> None:
-    if ip_limiter is not None:
-        ip_limiter.check(request)
+    limiter = public_limiter()
+    if limiter is not None:
+        limiter.check(request)
 
 
 @router.get("/api/search")
@@ -125,9 +126,21 @@ async def api_suggest(request: Request, q: str = Query(..., min_length=1, max_le
 
 @router.get("/api/trending")
 async def api_trending(request: Request, limit: int = Query(10, ge=1, le=50)):
+    """The most played entries of the curated catalog.
+
+    The catalog holds no view counter, so the order is the curated one and
+    not a live chart. The live chart is served by the key protected
+    /trending route.
+    """
     _guard(request)
     results = _index(request).trending(limit)
-    return {"success": True, "total_results": len(results), "results": results}
+    return {
+        "success": True,
+        "total_results": len(results),
+        "source": "catalog",
+        "hint": "The curated catalog in its curated order, /trending serves the live chart.",
+        "results": results,
+    }
 
 
 @router.get("/api/stats")

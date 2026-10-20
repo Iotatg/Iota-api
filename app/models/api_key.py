@@ -6,7 +6,7 @@ user exactly once at creation time and cannot be recovered.
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -80,8 +80,16 @@ class APIKey(Base):
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         if self.expires_at is None:
             return False
-        now = now or datetime.utcnow()
-        return now >= self.expires_at
+        now = now or datetime.now(timezone.utc)
+        expires_at = self.expires_at
+        # The column is timezone aware, but a value that was stored as a naive
+        # datetime comes back without an offset. Both sides are normalised to
+        # UTC so the comparison never raises.
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now >= expires_at
 
     def is_usable(self, now: Optional[datetime] = None) -> bool:
         return self.active and not self.is_expired(now)

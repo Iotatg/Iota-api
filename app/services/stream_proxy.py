@@ -194,19 +194,21 @@ class StreamProxy:
         self,
         url: str,
         start: int,
-        end: int,
+        end: Optional[int],
         chunk_size: int = 65536,
     ) -> AsyncIterator[bytes]:
         """Yield bytes [start, end] from the upstream, honouring Range.
 
         The client should already have validated start/end against the
-        upstream Content-Length; this method trusts those bounds.
+        upstream Content-Length; this method trusts those bounds. An end of
+        None means the upstream does not report a length, the body is then
+        streamed to its end.
         """
         if start < 0:
             raise ValueError("start must be >= 0")
-        if end < start:
+        if end is not None and end < start:
             raise ValueError("end must be >= start")
-        headers = {"Range": f"bytes={start}-{end}"}
+        headers = {} if end is None else {"Range": f"bytes={start}-{end}"}
         client = await self._get_client()
         try:
             resp = await client.send(
@@ -230,7 +232,7 @@ class StreamProxy:
         self,
         url: str,
         start: int,
-        end: int,
+        end: Optional[int],
         chunk_size: int = 65536,
         workers: int = _PARALLEL_WORKERS,
     ) -> AsyncIterator[bytes]:
@@ -242,9 +244,16 @@ class StreamProxy:
         lifts aggregate throughput to several MB/s. Bytes are
         emitted strictly in order; each segment buffers only a
         small number of chunks, so memory stays bounded.
+
+        An unknown length (end is None) cannot be split, the body is then
+        streamed with a single connection.
         """
         if start < 0:
             raise ValueError("start must be >= 0")
+        if end is None:
+            async for chunk in self.stream(url, start, None, chunk_size):
+                yield chunk
+            return
         if end < start:
             raise ValueError("end must be >= start")
         total = end - start + 1

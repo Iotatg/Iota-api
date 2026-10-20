@@ -74,7 +74,7 @@ class LocalStorage(StorageService):
     def _resolve(self, key: str) -> Path:
         # Defend against path traversal: resolve and ensure it stays under base.
         candidate = (self.base / key).resolve()
-        if not str(candidate).startswith(str(self.base)):
+        if not candidate.is_relative_to(self.base):
             raise StorageError(f"invalid storage key: {key!r}")
         return candidate
 
@@ -155,14 +155,14 @@ class S3Storage(StorageService):
         try:
             await self._run(self.client.head_object, Bucket=self.bucket, Key=key)
             return True
-        except _NotFound:
+        except _is_not_found:
             return False
 
     async def size(self, key: str) -> int:
         try:
             resp = await self._run(self.client.head_object, Bucket=self.bucket, Key=key)
             return int(resp["ContentLength"])
-        except _NotFound as e:
+        except _is_not_found as e:
             raise ObjectNotFoundError(key) from e
 
     async def open_stream(
@@ -173,7 +173,7 @@ class S3Storage(StorageService):
             resp = await self._run(
                 self.client.get_object, Bucket=self.bucket, Key=key, Range=range_header
             )
-        except _NotFound as e:
+        except _is_not_found as e:
             raise ObjectNotFoundError(key) from e
 
         body = resp["Body"]
@@ -211,8 +211,23 @@ class S3Storage(StorageService):
         return await asyncio.to_thread(func, *args, **kwargs)
 
 
-class _NotFound(Exception):
-    pass
+def _is_not_found(error: Exception) -> bool:
+    """Tell whether a boto3 error means "the object does not exist".
+
+    boto3 never raises a dedicated not-found exception for a missing key, it
+    raises a ClientError whose code names the missing resource.
+    """
+    try:
+        from botocore.exceptions import ClientError
+    except ImportError:  # pragma: no cover - boto3 is optional in dev
+        return False
+
+    if not isinstance(error, ClientError):
+        return False
+
+    code = str(error.response.get("Error", {}).get("Code", ""))
+    status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in {"404", "NoSuchKey", "NoSuchBucket", "NotFound"} or status == 404
 
 
 def make_storage() -> StorageService:

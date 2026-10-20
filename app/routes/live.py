@@ -17,7 +17,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.catalog.ip_limit import IpSlidingWindow
+from app.catalog.ip_limit import public_limiter
 from app.dependencies import get_provider, get_stream_proxy
 from app.routes.stream import _parse_range
 from app.services.media_provider import (
@@ -34,18 +34,19 @@ logger = get_logger(__name__)
 
 router = APIRouter()
 # Public per-IP rate limit. 0 disables the limit entirely (unlimited);
-# override with IOTA_PUBLIC_RPM=<requests per minute> to re-enable.
-PUBLIC_RPM = int(os.environ.get("IOTA_PUBLIC_RPM", "0"))
-ip_limiter = IpSlidingWindow(PUBLIC_RPM) if PUBLIC_RPM > 0 else None
+# override with IOTA_PUBLIC_RPM=<requests per minute> to re-enable. Every
+# public route shares one limiter.
 
 RECENT_TTL_SECONDS = 900
 MAX_TRACKED_IPS = 4096
-_IP_PREFIXES = ("yt:", "dz:", "am:", "sp:", "mb:", "resso:", "boomplay:")
+# Every prefix a provider can return, see app/services/provider_registry.py.
+_IP_PREFIXES = ("yt:", "dz:", "am:", "sp:", "mb:", "jv:", "sc:", "bp:", "rs:")
 
 
 def _guard(request: Request) -> None:
-    if ip_limiter is not None:
-        ip_limiter.check(request)
+    limiter = public_limiter()
+    if limiter is not None:
+        limiter.check(request)
 
 
 def _client_ip(request: Request) -> str:

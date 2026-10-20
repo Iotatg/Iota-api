@@ -317,83 +317,106 @@ async def _do_stream(
                     "detail": f"Limit: {api_key.concurrent_streams_limit}."},
         )
 
-    # ── 5. Range parsing ─────────────────────────────────────────────────
-    start, end, status_code, content_range = 0, size - 1, 200, None
-    if range_header:
-        parsed = _parse_range(range_header, size)
-        if parsed is not None:
-            start, end = parsed
-            status_code = 206
-            content_range = f"bytes {start}-{end}/{size}"
-    content_length = end - start + 1
+    slot_released = False
 
-    # ── 6. Bookkeeping ──────────────────────────────────────────────────
-    touch(api_key)
-    api_key.total_requests += 1
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-
-    active_streams.inc()
-    api_request_duration_seconds.labels(endpoint="stream", method=method).observe(
-        time.perf_counter() - started
-    )
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-        "Content-Type": mime_type,
-        "Content-Disposition": f'inline; filename="audio.{_ext_for(mime_type)}"',
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-    }
-    if content_range:
-        headers["Content-Range"] = content_range
-
-    chunk_size = settings.stream_chunk_size
-    if method == "HEAD":
-        # No body for HEAD. Release the slot now.
+    async def release_slot() -> None:
+        """Give the concurrent stream slot back exactly once."""
+        nonlocal slot_released
+        if slot_released:
+            return
+        slot_released = True
         await rate_limiter.release_stream(api_key.id, token)
-        active_streams.dec()
-        return StreamingResponse(
-            iter(()),
-            status_code=status_code,
-            headers=headers,
-            media_type=mime_type,
+
+    try:
+        # ── 5. Range parsing ─────────────────────────────────────────────
+        # An upstream that reports no length has an unknown size: the body is
+        # streamed to its end and the answer is sent chunked. A range cannot
+        # be served for such an upstream.
+        known_size = size > 0
+        start = 0
+        end = size - 1 if known_size else None
+        status_code, content_range = 200, None
+        if range_header:
+            if not known_size:
+                raise HTTPException(status_code=416, detail={
+                    "error": "range_not_satisfiable",
+                    "detail": "The upstream reports no length, ranges are not supported.",
+                })
+            parsed = _parse_range(range_header, size)
+            if parsed is not None:
+                start, end = parsed
+                status_code = 206
+                content_range = f"bytes {start}-{end}/{size}"
+        content_length = end - start + 1 if end is not None else None
+
+        # ── 6. Bookkeeping ───────────────────────────────────────────────
+        touch(api_key)
+        api_key.total_requests += 1
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+
+        active_streams.inc()
+        api_request_duration_seconds.labels(endpoint="stream", method=method).observe(
+            time.perf_counter() - started
         )
 
-    async def body() -> AsyncIterator[bytes]:
-        sent = 0
-        try:
-            if stream_kind == "proxy":
-                workers = settings.stream_parallel_workers
-                if workers > 1:
-                    stream_iter = stream_proxy.stream_parallel(
-                        stream_target, start=start, end=end,
-                        chunk_size=chunk_size, workers=workers,
-                    )
-                else:
-                    stream_iter = stream_proxy.stream(
-                        stream_target, start=start, end=end,
-                        chunk_size=chunk_size,
-                    )
-                async for chunk in stream_iter:
-                    sent += len(chunk)
-                    yield chunk
-            else:
-                async for chunk in storage.open_stream(
-                    stream_target, start=start, end=end
-                ):
-                    sent += len(chunk)
-                    yield chunk
-        except ProviderUnavailableError:
-            await _invalidate_upstream(provider, media_id)
-            raise
-        finally:
-            stream_bytes_total.labels(endpoint="stream").inc(sent)
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": mime_type,
+            "Content-Disposition": f'inline; filename="audio.{_ext_for(mime_type)}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if content_length is not None:
+            headers["Content-Length"] = str(content_length)
+        if content_range:
+            headers["Content-Range"] = content_range
+
+        chunk_size = settings.stream_chunk_size
+        if method == "HEAD":
+            # No body for HEAD. Release the slot now.
+            await release_slot()
             active_streams.dec()
-            await rate_limiter.release_stream(api_key.id, token)
+            return StreamingResponse(
+                iter(()),
+                status_code=status_code,
+                headers=headers,
+                media_type=mime_type,
+            )
+
+        async def body() -> AsyncIterator[bytes]:
+            sent = 0
+            try:
+                if stream_kind == "proxy":
+                    workers = settings.stream_parallel_workers
+                    if workers > 1 and end is not None:
+                        stream_iter = stream_proxy.stream_parallel(
+                            stream_target, start=start, end=end,
+                            chunk_size=chunk_size, workers=workers,
+                        )
+                    else:
+                        stream_iter = stream_proxy.stream(
+                            stream_target, start=start, end=end,
+                            chunk_size=chunk_size,
+                        )
+                    async for chunk in stream_iter:
+                        sent += len(chunk)
+                        yield chunk
+                else:
+                    async for chunk in storage.open_stream(
+                        stream_target, start=start, end=end
+                    ):
+                        sent += len(chunk)
+                        yield chunk
+            except ProviderUnavailableError:
+                await _invalidate_upstream(provider, media_id)
+                raise
+            finally:
+                stream_bytes_total.labels(endpoint="stream").inc(sent)
+                active_streams.dec()
+                await release_slot()
             # Best-effort: update bytes_streamed counter
             api_key.bytes_streamed += sent
             try:
@@ -409,9 +432,15 @@ async def _do_stream(
                 "source": stream_kind,
             })
 
-    return StreamingResponse(
-        body(),
-        status_code=status_code,
-        headers=headers,
-        media_type=mime_type,
-    )
+        return StreamingResponse(
+            body(),
+            status_code=status_code,
+            headers=headers,
+            media_type=mime_type,
+        )
+    except BaseException:
+        # Everything that fails before the response is built has to give the
+        # concurrent stream slot back, otherwise the slot leaks until the
+        # process restarts.
+        await release_slot()
+        raise

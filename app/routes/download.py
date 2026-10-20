@@ -253,19 +253,27 @@ def _merge_cache_path(settings, media_id: str, max_height: Optional[int]) -> Pat
 def _stash_merge_cache(settings, cache_path: Path, merged_tmp: str) -> None:
     """Move a freshly merged temp file into the cache (best effort).
 
-    Skips if another request already cached the same key; trims
-    the cache directory to its size budget once stored."""
+    Skips if another request already cached the same key, in that case the
+    freshly merged copy is dropped so it does not stay on the disk. The cache
+    can live on another filesystem than the temp file, then the file is copied
+    instead of renamed."""
+    tmp_stash = str(cache_path) + f".part{os.getpid()}.{time.time_ns()}"
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         if cache_path.exists() and cache_path.stat().st_size > 0:
+            with contextlib.suppress(OSError):
+                os.unlink(merged_tmp)
             return
-        tmp_stash = str(cache_path) + f".part{os.getpid()}.{time.time_ns()}"
-        os.replace(merged_tmp, tmp_stash)
+        try:
+            os.replace(merged_tmp, tmp_stash)
+        except OSError:
+            # Different filesystems cannot be renamed into each other.
+            shutil.move(merged_tmp, tmp_stash)
         os.replace(tmp_stash, cache_path)
         _trim_merge_cache(settings)
     except OSError:
         with contextlib.suppress(OSError):
-            Path(str(cache_path) + f".part{os.getpid()}").unlink(missing_ok=True)
+            Path(tmp_stash).unlink(missing_ok=True)
 
 
 def _trim_merge_cache(settings) -> None:

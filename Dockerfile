@@ -16,7 +16,9 @@ RUN pip install -r requirements.txt
 
 COPY app/ ./app/
 COPY scripts/ ./scripts/
-COPY data/cached_tracks.json ./data/
+# The whole data directory is needed: songs.json holds the curated catalog the
+# public routes serve, cached_tracks.json the offline fallback renditions.
+COPY data/ ./data/
 
 RUN mkdir -p /app/storage/audio \
     && python3 scripts/seed_demo.py /app/storage/audio

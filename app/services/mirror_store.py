@@ -14,7 +14,9 @@ Safety invariants mirror the offline catalog:
   StreamProxy with a generic browser UA;
 - index entries carry an expiry and are dropped on load/read after
   it, so a purged mirror degrades gracefully to the normal tiers;
-- ``IOTA_MIRROR=0`` disables reading *and* writing entirely.
+- the mirror is opt-in: ``IOTA_MIRROR=1`` enables reading *and*
+  writing, the default is off because it ships user traffic to a
+  third-party file host.
 """
 from __future__ import annotations
 
@@ -86,7 +88,9 @@ def _store_note_failure() -> None:
 
 
 def is_enabled() -> bool:
-    return os.getenv("IOTA_MIRROR", "1") != "0"
+    """The mirror ships traffic to a third-party host, so it stays off
+    until the deployment opts in with ``IOTA_MIRROR=1``."""
+    return os.getenv("IOTA_MIRROR", "0") == "1"
 
 
 def _video_id(media_id: str) -> str:
