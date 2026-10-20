@@ -10,7 +10,8 @@ touches the audio stream itself.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -20,6 +21,7 @@ from app.services.media_provider import (
     MediaProvider,
     StreamSource,
 )
+from app.config import get_settings
 from app.services.youtube_provider import YouTubeProvider
 from app.utils.logging import get_logger
 
@@ -55,6 +57,13 @@ class SpotifyProvider(MediaProvider):
         self._client_id = client_id
         self._client_secret = client_secret
         self._spotipy = None
+        # The spotify → youtube resolution is a slow search, the answer is
+        # kept for a while so the info and the stream of one track do not
+        # pay for it twice.
+        self._resolve_cache: Dict[str, Tuple[float, MediaMetadata]] = {}
+        self._resolve_cache_ttl = float(
+            get_settings().metadata_cache_ttl or 0
+        )
         if client_id and client_secret:
             try:
                 import spotipy  # type: ignore
@@ -85,7 +94,35 @@ class SpotifyProvider(MediaProvider):
             return None
         return resp.json() or None
 
+    def _cache_get(self, media_id: str) -> Optional[MediaMetadata]:
+        """Return the cached resolution of a track, if there is one."""
+        if self._resolve_cache_ttl <= 0:
+            return None
+        entry = self._resolve_cache.get(media_id)
+        if entry is None:
+            return None
+        expires, meta = entry
+        if time.monotonic() > expires:
+            self._resolve_cache.pop(media_id, None)
+            return None
+        return meta
+
+    def _cache_put(self, media_id: str, meta: MediaMetadata) -> None:
+        """Keep the resolution of a track for the next request."""
+        if self._resolve_cache_ttl <= 0:
+            return
+        if len(self._resolve_cache) >= 5000:
+            now = time.monotonic()
+            for key, (expires, _) in list(self._resolve_cache.items()):
+                if now > expires:
+                    self._resolve_cache.pop(key, None)
+        self._resolve_cache[media_id] = (time.monotonic() + self._resolve_cache_ttl, meta)
+
     async def _resolve_to_yt(self, media_id: str) -> Optional[MediaMetadata]:
+        cached = self._cache_get(media_id)
+        if cached is not None:
+            return cached
+
         native_id = _extract_spotify_id(media_id)
         spotify_url = f"https://open.spotify.com/track/{native_id}"
         info = None
@@ -116,7 +153,7 @@ class SpotifyProvider(MediaProvider):
         if not results:
             return None
         first = results[0]
-        return MediaMetadata(
+        meta = MediaMetadata(
             media_id=first.media_id,
             title=info["title"],
             artist=artist or first.artist,
@@ -126,6 +163,8 @@ class SpotifyProvider(MediaProvider):
             storage_key="",
             provider=self.name,
         )
+        self._cache_put(media_id, meta)
+        return meta
 
     async def search(self, query: str, limit: int = 20) -> List[MediaMetadata]:
         if not query or not query.strip():
