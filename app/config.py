@@ -118,10 +118,13 @@ class Settings(BaseSettings):
     video_merge_cache_dir: str = ".data/merge-cache"
     # Budget for the merged-video cache directory in megabytes.
     video_merge_cache_max_mb: int = 1024
-    # Hard cap on requested video heights (1080p fetches are far too
-    # large for voice-chat previews; 720p keeps quality while cutting
-    # size and fetch time roughly in half).
+    # Default ceiling on requested video heights. Voice-chat previews
+    # want 720p: 1080p+ fetches are far too large and slow for them.
     video_max_height_cap: int = 720
+    # Hard ceiling an explicit request may reach. A client asking for
+    # 4K (``?max_height=2160``) is served up to this height; larger
+    # values are clamped instead of rejected so clients do not break.
+    video_max_height_hard_cap: int = 2160
 
     # ── Demo provider ─────────────────────────────────────────────────────
     demo_audio_dir: str = "./storage/audio"

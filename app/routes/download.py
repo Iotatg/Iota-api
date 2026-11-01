@@ -217,6 +217,63 @@ async def _merge_dash_to_temp(
                     os.unlink(tmp)
 
 
+def _url_is_manifest(url: Optional[str]) -> bool:
+    """True when a resolved URL is a playlist, not media bytes."""
+    if not url:
+        return False
+    low = url.lower()
+    return ".m3u8" in low or ".mpd" in low or "manifest" in low
+
+
+async def _merge_hls_to_temp(
+    video_url: str,
+    audio_url: Optional[str],
+) -> str:
+    """Remux an HLS variant playlist into a local MP4 with ffmpeg.
+
+    A playlist is metadata, not media: only ffmpeg can fetch its
+    segments and write the actual video bytes. When a separate
+    audio track exists it is muxed in as a second input; ffmpeg
+    copies both streams (no re-encode) so the remux stays fast.
+    Returns the merged path; the caller deletes it.
+
+    HLS remuxes are bounded but slow (a 4K song can take minutes),
+    so the subprocess gets a generous timeout and its stderr is
+    surfaced on failure instead of a bare 502."""
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-timeout", "600000000",
+        "-i", video_url,
+    ]
+    if audio_url:
+        cmd += ["-i", audio_url]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+    cmd += ["-c", "copy", "-movflags", "faststart", path]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise ProviderUnavailableError("ffmpeg hls remux timed out")
+    if proc.returncode != 0:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        tail = stderr.decode(errors="ignore")[-800:]
+        raise ProviderUnavailableError(f"ffmpeg hls remux failed: {tail}")
+    return path
+
+
 async def _temp_file_stream(
     path: str, start: int, end: int, chunk_size: int = 65536
 ) -> AsyncIterator[bytes]:
@@ -585,13 +642,24 @@ async def _do_download(
             },
         )
 
+    # ── 1a. Effective video height (before resolving!) ──────────────
+    # Default is the soft cap (720p, sized for voice-chat previews);
+    # an explicit request is honoured up to the hard cap (2160p), so a
+    # client can opt into 4K. Resolving first and clamping after (the
+    # old order) fetched multi-hundred-MB streams only to relabel them.
+    effective_height = max_height
+    if kind == "video":
+        requested = max_height or settings.video_max_height_cap
+        hard = max(1, settings.video_max_height_hard_cap)
+        effective_height = min(max(1, requested), hard)
+
     # ── 2. Provider → resolve a stream source for the requested kind
     # (a mirror copy, when one exists and the provider is down, is
     # reached through relay_source's tier chain — the live provider is
     # always faster than the mirror host and is tried first.)
     try:
         src = await provider.get_stream_by_type(
-            media_id, kind, prefer_dash=(kind == "video"), max_height=max_height
+            media_id, kind, prefer_dash=(kind == "video"), max_height=effective_height
         )
     except MediaNotFoundError:
         raise HTTPException(status_code=404, detail={
@@ -627,28 +695,21 @@ async def _do_download(
             src=src, method=method, started=started,
         )
 
-    # ── 2c. Video height clamp ──────────────────────────────────────
-    # 1080p DASH fetches regularly exceed 400 MB for a single song
-    # video; voice-chat clients never benefit from that. Clamp every
-    # request (explicit or default) to the configured cap.
-    if kind == "video":
-        cap = settings.video_max_height_cap
-        max_height = min(max_height, cap) if max_height else cap
-
-    # ── 3. Resolve size + decide storage vs proxy vs dash path ──────
+    # ── 3. Resolve size + decide storage vs proxy vs dash/hls path ──
     dash_tmp_path: Optional[str] = None
     delete_dash_after = False
     merge_cache_path: Optional[Path] = None
+    size_known = True
     if src.is_dash and src.direct_url and src.direct_url_audio:
-        # High-quality video: two DASH streams that must be
-        # remuxed together. A prior merge may be cached on disk —
+        # High-quality video: two progressive DASH streams that must
+        # be remuxed together. A prior merge may be cached on disk —
         # serve it directly and skip the multi-minute refetch.
         # Without a cache hit, for GET we merge the streams into a
         # temp file with ffmpeg and serve it Range-capable; for
         # HEAD we approximate the size as the sum of the two
         # streams so a probe never triggers a full merge.
         mime_type = "video/mp4"
-        merge_cache_path = _merge_cache_path(settings, media_id, max_height)
+        merge_cache_path = _merge_cache_path(settings, media_id, effective_height)
         if (
             merge_cache_path.is_file()
             and merge_cache_path.stat().st_size > 100_000
@@ -693,19 +754,99 @@ async def _do_download(
                 delete_dash_after = True
             size = os.path.getsize(dash_tmp_path)
             stream_target = dash_tmp_path
+    elif src.is_hls and src.direct_url:
+        # Manifest-based video: an m3u8 playlist describes segments
+        # but carries no media bytes. Only ffmpeg can assemble it
+        # into the seekable MP4 a download client expects. Merged
+        # results are disk-cached like DASH merges; a HEAD never
+        # triggers the (multi-minute) remux and reports no size
+        # because the output length is unknown until it runs.
+        mime_type = "video/mp4"
+        merge_cache_path = _merge_cache_path(settings, media_id, effective_height)
+        if (
+            merge_cache_path.is_file()
+            and merge_cache_path.stat().st_size > 100_000
+        ):
+            dash_tmp_path = str(merge_cache_path)
+            size = merge_cache_path.stat().st_size
+            stream_kind = "hls_cache"
+            stream_target = dash_tmp_path
+        elif method == "HEAD":
+            stream_kind = "hls_head"
+            stream_target = ""
+            size = 0
+            size_known = False
+        else:
+            try:
+                dash_tmp_path = await _merge_hls_to_temp(
+                    src.direct_url, src.direct_url_audio
+                )
+            except ProviderUnavailableError as e:
+                await _invalidate_upstream(provider, media_id)
+                raise HTTPException(status_code=502, detail={
+                    "error": "upstream_unavailable",
+                    "detail": str(e),
+                })
+            _stash_merge_cache(settings, merge_cache_path, dash_tmp_path)
+            if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
+                dash_tmp_path = str(merge_cache_path)
+                stream_kind = "hls_cache"
+            else:
+                stream_kind = "hls_temp"
+                delete_dash_after = True
+            size = os.path.getsize(dash_tmp_path)
+            stream_target = dash_tmp_path
     elif src.direct_url:
-        try:
-            head = await stream_proxy.head(src.direct_url)
-        except ProviderUnavailableError as e:
-            await _invalidate_upstream(provider, media_id)
-            raise HTTPException(status_code=502, detail={
-                "error": "upstream_unavailable",
-                "detail": str(e),
-            })
-        size = head.size_bytes
-        mime_type = head.content_type or src.mime_type
-        stream_kind = "proxy"
-        stream_target = src.direct_url
+        # A playlist URL would otherwise be proxied as if it were the
+        # media file, handing the client a tiny text manifest. Treat
+        # it like the HLS branch: remux into a real MP4 first.
+        if _url_is_manifest(src.direct_url):
+            mime_type = "video/mp4"
+            merge_cache_path = _merge_cache_path(settings, media_id, effective_height)
+            if (
+                merge_cache_path.is_file()
+                and merge_cache_path.stat().st_size > 100_000
+            ):
+                dash_tmp_path = str(merge_cache_path)
+                size = merge_cache_path.stat().st_size
+                stream_kind = "hls_cache"
+                stream_target = dash_tmp_path
+            elif method == "HEAD":
+                stream_kind = "hls_head"
+                stream_target = ""
+                size = 0
+                size_known = False
+            else:
+                try:
+                    dash_tmp_path = await _merge_hls_to_temp(src.direct_url, None)
+                except ProviderUnavailableError as e:
+                    await _invalidate_upstream(provider, media_id)
+                    raise HTTPException(status_code=502, detail={
+                        "error": "upstream_unavailable",
+                        "detail": str(e),
+                    })
+                _stash_merge_cache(settings, merge_cache_path, dash_tmp_path)
+                if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
+                    dash_tmp_path = str(merge_cache_path)
+                    stream_kind = "hls_cache"
+                else:
+                    stream_kind = "hls_temp"
+                    delete_dash_after = True
+                size = os.path.getsize(dash_tmp_path)
+                stream_target = dash_tmp_path
+        else:
+            try:
+                head = await stream_proxy.head(src.direct_url)
+            except ProviderUnavailableError as e:
+                await _invalidate_upstream(provider, media_id)
+                raise HTTPException(status_code=502, detail={
+                    "error": "upstream_unavailable",
+                    "detail": str(e),
+                })
+            size = head.size_bytes
+            mime_type = head.content_type or src.mime_type
+            stream_kind = "proxy"
+            stream_target = src.direct_url
     else:
         if not await storage.exists(src.storage_key):
             raise HTTPException(status_code=404, detail={
@@ -727,14 +868,17 @@ async def _do_download(
         )
 
     # ── 5. Range parsing ────────────────────────────────────────────
+    # An HLS HEAD has no reliable size (the remux has not run), so it
+    # reports neither Content-Length nor Range support; the GET path
+    # produces a complete, Range-capable MP4.
     start, end, status_code, content_range = 0, size - 1, 200, None
-    if range_header:
+    if size_known and range_header:
         parsed = _parse_range(range_header, size)
         if parsed is not None:
             start, end = parsed
             status_code = 206
             content_range = f"bytes {start}-{end}/{size}"
-    content_length = end - start + 1
+    content_length = end - start + 1 if size_known else None
 
     # ── 6. Filename from metadata (best effort) ─────────────────────
     title = await _title_for(provider, media_id)
@@ -754,13 +898,14 @@ async def _do_download(
     )
 
     headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
+        "Accept-Ranges": "bytes" if size_known else "none",
         "Content-Type": mime_type,
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
         "Content-Disposition": _content_disposition(filename),
     }
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
     if content_range:
         headers["Content-Range"] = content_range
 
@@ -770,9 +915,7 @@ async def _do_download(
         await rate_limiter.release_stream(api_key.id, token)
         active_streams.dec()
         return StreamingResponse(
-            iter(()),
-            status_code=status_code,
-            headers=headers,
+            iter(()), status_code=status_code, headers=headers,
             media_type=mime_type,
         )
 
@@ -790,7 +933,9 @@ async def _do_download(
         tee = bytearray() if mirrorable else None
         completed = False
         try:
-            if stream_kind in ("dash_temp", "dash_cache"):
+            if stream_kind in (
+                "dash_temp", "dash_cache", "hls_temp", "hls_cache",
+            ):
                 async for chunk in _temp_file_stream(
                     stream_target, start, end, chunk_size
                 ):

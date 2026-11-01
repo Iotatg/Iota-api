@@ -67,6 +67,11 @@ class StreamSource:
     # YouTube only serves those resolutions as separate streams.
     direct_url_audio: Optional[str] = None
     is_dash: bool = False
+    # HLS support: when is_hls is True, direct_url points at an m3u8
+    # playlist (and direct_url_audio at an optional separate audio
+    # track). The playlist must be remuxed into a real MP4 by ffmpeg
+    # before it can be served — a playlist is not media bytes.
+    is_hls: bool = False
 
 
 class ProviderError(Exception):

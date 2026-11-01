@@ -22,7 +22,8 @@ from app.services.media_provider import (
 )
 from app.services.youtube_provider import (
     YouTubeProvider,
-    _pick_dash_formats,
+    _pick_video_split,
+    _VideoSplit,
     _run_ytdlp,
     _YtdlpResult,
 )
@@ -369,16 +370,20 @@ class TestDurationParsing:
 
 
 class TestDashVideo:
+    def _split(self, height=1080, is_hls=False):
+        return _VideoSplit(
+            info={"title": "T"},
+            video_url="https://cdn.up.test/video-only.mp4?sig=v",
+            audio_url="https://cdn.up.test/audio-only.m4a?sig=a",
+            height=height,
+            is_hls=is_hls,
+        )
+
     def test_dash_returns_split_streams(self):
         p = YouTubeProvider(api_key=None)
         with patch.object(
-            p, "_ytdlp_video_dash",
-            AsyncMock(return_value=(
-                {"title": "T"},
-                "https://cdn.up.test/video-only.mp4?sig=v",
-                "https://cdn.up.test/audio-only.m4a?sig=a",
-                1080,
-            )),
+            p, "_ytdlp_video_split",
+            AsyncMock(return_value=self._split(height=1080)),
         ) as m:
             import asyncio
             src = asyncio.get_event_loop().run_until_complete(
@@ -390,20 +395,83 @@ class TestDashVideo:
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ", max_height=None
         )
         assert src.is_dash is True
+        assert src.is_hls is False
         assert src.direct_url == "https://cdn.up.test/video-only.mp4?sig=v"
         assert src.direct_url_audio == "https://cdn.up.test/audio-only.m4a?sig=a"
         assert src.mime_type == "video/mp4"
 
-    def test_dash_below_ceiling_falls_back_to_merged(self):
+    def test_hls_split_returns_hls_source(self):
         p = YouTubeProvider(api_key=None)
         with patch.object(
-            p, "_ytdlp_video_dash",
+            p, "_ytdlp_video_split",
+            AsyncMock(return_value=self._split(height=2160, is_hls=True)),
+        ):
+            import asyncio
+            src = asyncio.get_event_loop().run_until_complete(
+                p.get_stream_by_type(
+                    "dQw4w9WgXcQ", "video", prefer_dash=True
+                )
+            )
+        assert src.is_hls is True
+        assert src.is_dash is False
+        assert src.direct_url == "https://cdn.up.test/video-only.mp4?sig=v"
+        assert src.direct_url_audio == "https://cdn.up.test/audio-only.m4a?sig=a"
+
+    def test_dash_below_ceiling_still_uses_split(self):
+        """A split that beats the best merged file is used even below
+        1080p — that is what delivers a true 720p file."""
+        p = YouTubeProvider(api_key=None)
+        with patch.object(
+            p, "_ytdlp_video_split",
+            AsyncMock(return_value=self._split(height=720)),
+        ), patch.object(
+            p, "_ytdlp_info_and_url",
             AsyncMock(return_value=(
-                {"title": "T"},
-                "https://cdn.up.test/v.mp4",
-                "https://cdn.up.test/a.m4a",
-                720,
+                {"title": "T"}, "https://cdn.up.test/merged.mp4"
             )),
+        ) as info_m:
+            import asyncio
+            src = asyncio.get_event_loop().run_until_complete(
+                p.get_stream_by_type(
+                    "dQw4w9WgXcQ", "video", prefer_dash=True
+                )
+            )
+        info_m.assert_not_awaited()
+        assert src.is_dash is True
+        assert src.direct_url == "https://cdn.up.test/video-only.mp4?sig=v"
+
+    def test_merged_only_source_falls_back_to_merged(self):
+        """With no split available the merged path is used as before."""
+        p = YouTubeProvider(api_key=None)
+        with patch.object(
+            p, "_ytdlp_video_split",
+            AsyncMock(return_value=_VideoSplit(
+                info={"title": "T"},
+                video_url="https://cdn.up.test/merged360.mp4",
+                audio_url=None,
+                height=360,
+            )),
+        ), patch.object(
+            p, "_ytdlp_info_and_url",
+            AsyncMock(return_value=(
+                {"title": "T"}, "https://cdn.up.test/merged.mp4"
+            )),
+        ) as info_m:
+            import asyncio
+            src = asyncio.get_event_loop().run_until_complete(
+                p.get_stream_by_type(
+                    "dQw4w9WgXcQ", "video", prefer_dash=True
+                )
+            )
+        info_m.assert_awaited_once()
+        assert src.is_dash is False
+        assert src.is_hls is False
+        assert src.direct_url == "https://cdn.up.test/merged.mp4"
+
+    def test_dash_unavailable_falls_back_to_merged(self):
+        p = YouTubeProvider(api_key=None)
+        with patch.object(
+            p, "_ytdlp_video_split", AsyncMock(return_value=None)
         ), patch.object(
             p, "_ytdlp_info_and_url",
             AsyncMock(return_value=(
@@ -420,23 +488,26 @@ class TestDashVideo:
         assert src.is_dash is False
         assert src.direct_url == "https://cdn.up.test/merged.mp4"
 
-    def test_dash_unavailable_falls_back_to_merged(self):
+    def test_merged_manifest_url_is_flagged_hls(self):
+        """A merged-path playlist URL must be flagged so the download
+        route remuxes it instead of proxying the text manifest."""
         p = YouTubeProvider(api_key=None)
         with patch.object(
-            p, "_ytdlp_video_dash", AsyncMock(return_value=None)
+            p, "_ytdlp_video_split", AsyncMock(return_value=None)
         ), patch.object(
             p, "_ytdlp_info_and_url",
             AsyncMock(return_value=(
-                {"title": "T"}, "https://cdn.up.test/merged.mp4"
+                {"title": "T"},
+                "https://cdn.up.test/variant.m3u8?sig=x",
             )),
-        ) as info_m:
+        ):
             import asyncio
             src = asyncio.get_event_loop().run_until_complete(
                 p.get_stream_by_type(
                     "dQw4w9WgXcQ", "video", prefer_dash=True
                 )
             )
-        info_m.assert_awaited_once()
+        assert src.is_hls is True
         assert src.is_dash is False
 
     def test_dash_not_used_for_audio(self):
@@ -447,8 +518,8 @@ class TestDashVideo:
                 {"title": "T"}, "https://cdn.up.test/a.m4a"
             )),
         ) as info_m, patch.object(
-            p, "_ytdlp_video_dash", AsyncMock(return_value=None)
-        ) as dash_m:
+            p, "_ytdlp_video_split", AsyncMock(return_value=None)
+        ) as split_m:
             import asyncio
             src = asyncio.get_event_loop().run_until_complete(
                 p.get_stream_by_type(
@@ -456,7 +527,7 @@ class TestDashVideo:
                 )
             )
         info_m.assert_awaited_once()
-        dash_m.assert_not_awaited()
+        split_m.assert_not_awaited()
         assert src.is_dash is False
 
     def test_video_without_prefer_dash_uses_merged(self):
@@ -467,67 +538,207 @@ class TestDashVideo:
                 {"title": "T"}, "https://cdn.up.test/v.mp4"
             )),
         ) as info_m, patch.object(
-            p, "_ytdlp_video_dash", AsyncMock(return_value=None)
-        ) as dash_m:
+            p, "_ytdlp_video_split", AsyncMock(return_value=None)
+        ) as split_m:
             import asyncio
             src = asyncio.get_event_loop().run_until_complete(
                 p.get_stream_by_type("dQw4w9WgXcQ", "video")
             )
         info_m.assert_awaited_once()
-        dash_m.assert_not_awaited()
+        split_m.assert_not_awaited()
         assert src.is_dash is False
 
 
-class TestPickDashFormats:
+class TestPickVideoSplit:
     @staticmethod
     def _info():
         return {"formats": [
-            # merged (video+audio) — ignored for DASH selection
+            # merged 360p (itag 18-like)
             {"format_id": "18", "vcodec": "avc1.42001E", "acodec": "mp4a.40.2",
-             "height": 360, "width": 640, "ext": "mp4", "url": "https://x/m.mp4"},
-            # video-only
+             "height": 360, "width": 640, "ext": "mp4",
+             "url": "https://x/m360.mp4"},
+            # progressive DASH pair
             {"format_id": "137", "vcodec": "avc1.640028", "acodec": "none",
-             "height": 1080, "width": 1920, "ext": "mp4", "url": "https://x/v1080.mp4"},
+             "height": 1080, "width": 1920, "ext": "mp4",
+             "protocol": "https", "url": "https://x/v1080.mp4"},
             {"format_id": "313", "vcodec": "vp9", "acodec": "none",
-             "height": 2160, "width": 3840, "ext": "webm", "url": "https://x/v4k.webm"},
-            {"format_id": "4320", "vcodec": "av01.0.01M.08", "acodec": "none",
-             "height": 4320, "width": 7680, "ext": "webm", "url": "https://x/v8k.webm"},
-            # audio-only
+             "height": 2160, "width": 3840, "ext": "webm",
+             "protocol": "https", "url": "https://x/v4k.webm"},
             {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2",
-             "abr": 128, "ext": "m4a", "url": "https://x/a128.m4a"},
-            {"format_id": "251", "vcodec": "none", "acodec": "opus",
-             "abr": 160, "ext": "webm", "url": "https://x/a160.webm"},
+             "abr": 128, "ext": "m4a", "protocol": "https",
+             "url": "https://x/a128.m4a"},
         ]}
 
-    def test_selects_highest_video_and_audio(self):
-        video, audio = _pick_dash_formats(self._info(), max_height=0)
-        assert video["format_id"] == "4320"   # 8K, best available
-        assert audio["format_id"] == "251"    # highest abr (160)
+    def test_picks_progressive_dash_at_height(self):
+        split = _pick_video_split(self._info(), max_height=1080)
+        assert split is not None
+        assert split.height == 1080
+        assert split.is_hls is False
+        assert split.video_url == "https://x/v1080.mp4"
+        assert split.audio_url == "https://x/a128.m4a"
 
-    def test_respects_max_height(self):
-        video, audio = _pick_dash_formats(self._info(), max_height=2160)
-        assert video["format_id"] == "313"    # 4K (highest <= 2160)
-        assert audio["format_id"] == "251"
+    def test_merged_preferred_when_it_is_the_best_fit(self):
+        # a 1080 cap excludes the DASH 1080 only if merged is 1080;
+        # here merged is 360p and dash 1080 fits → dash wins (higher res)
+        split = _pick_video_split(self._info(), max_height=1080)
+        assert split.height == 1080
+        # with a 720 cap, only the merged 360p fits
+        low = _pick_video_split(self._info(), max_height=720)
+        assert low is not None
+        assert low.height == 360
+        assert low.is_hls is False
+        assert low.audio_url is None
 
-    def test_prefers_mp4_on_resolution_tie(self):
+    def test_hls_chosen_over_nothing(self):
         info = {"formats": [
-            {"format_id": "v1", "vcodec": "vp9", "acodec": "none",
-             "height": 1080, "width": 1920, "ext": "webm", "url": "https://x/v.webm"},
-            {"format_id": "v2", "vcodec": "avc1", "acodec": "none",
-             "height": 1080, "width": 1920, "ext": "mp4", "url": "https://x/v.mp4"},
-            {"format_id": "a", "vcodec": "none", "acodec": "opus",
-             "abr": 128, "ext": "webm", "url": "https://x/a.webm"},
+            {"format_id": "h1", "vcodec": "av01", "acodec": "none",
+             "height": 2160, "width": 3840, "ext": "mp4",
+             "protocol": "m3u8_native",
+             "url": "https://x/variant2160.m3u8"},
+            {"format_id": "a1", "vcodec": "none", "acodec": "mp4a.40.2",
+             "abr": 128, "ext": "m4a", "protocol": "https",
+             "url": "https://x/a128.m4a"},
         ]}
-        video, _ = _pick_dash_formats(info, 0)
-        assert video["format_id"] == "v2"     # mp4 preferred at equal resolution
+        split = _pick_video_split(info, max_height=2160)
+        assert split is not None
+        assert split.is_hls is True
+        assert split.height == 2160
+        assert split.video_url == "https://x/variant2160.m3u8"
+        assert split.audio_url == "https://x/a128.m4a"
 
-    def test_cap_above_available_returns_none(self):
-        # only 1080/4K/8K video-only exist; a 720 cap fits none
-        assert _pick_dash_formats(self._info(), max_height=720) is None
+    def test_manifest_never_returned_as_progressive(self):
+        info = {"formats": [
+            {"format_id": "h1", "vcodec": "avc1", "acodec": "none",
+             "height": 1080, "ext": "mp4", "protocol": "m3u8_native",
+             "url": "https://x/v1080.m3u8"},
+            {"format_id": "a1", "vcodec": "none", "acodec": "mp4a.40.2",
+             "abr": 128, "ext": "m4a", "protocol": "https",
+             "url": "https://x/a128.m4a"},
+        ]}
+        split = _pick_video_split(info, max_height=1080)
+        assert split is not None
+        assert split.is_hls is True
+        assert ".m3u8" in split.video_url
 
-    def test_no_dash_returns_none(self):
+    def test_cap_excludes_everything_returns_none(self):
         info = {"formats": [
             {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a",
-             "height": 360, "url": "https://x/m.mp4"},
+             "height": 360, "ext": "mp4", "url": "https://x/m.mp4"},
         ]}
-        assert _pick_dash_formats(info, 0) is None
+        assert _pick_video_split(info, max_height=240) is None
+
+    def test_empty_formats_returns_none(self):
+        assert _pick_video_split({"formats": []}, 0) is None
+
+
+class TestPickVideoSplitSelection:
+    """Resolution choice, cap handling and manifest safety."""
+
+    @staticmethod
+    def _info():
+        return {"formats": [
+            # merged (video+audio) — no remux needed
+            {"format_id": "18", "vcodec": "avc1.42001E", "acodec": "mp4a.40.2",
+             "height": 360, "width": 640, "ext": "mp4",
+             "url": "https://x/m.mp4"},
+            # progressive DASH video-only ladder
+            {"format_id": "137", "vcodec": "avc1.640028", "acodec": "none",
+             "height": 1080, "width": 1920, "ext": "mp4",
+             "protocol": "https", "url": "https://x/v1080.mp4"},
+            {"format_id": "313", "vcodec": "vp9", "acodec": "none",
+             "height": 2160, "width": 3840, "ext": "webm",
+             "protocol": "https", "url": "https://x/v4k.webm"},
+            {"format_id": "4320", "vcodec": "av01.0.01M.08", "acodec": "none",
+             "height": 4320, "width": 7680, "ext": "webm",
+             "protocol": "https", "url": "https://x/v8k.webm"},
+            # audio-only ladder
+            {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2",
+             "abr": 128, "ext": "m4a", "protocol": "https",
+             "url": "https://x/a128.m4a"},
+            {"format_id": "251", "vcodec": "none", "acodec": "opus",
+             "abr": 160, "ext": "webm", "protocol": "https",
+             "url": "https://x/a160.webm"},
+        ]}
+
+    def test_selects_best_available_without_cap(self):
+        split = _pick_video_split(self._info(), max_height=0)
+        assert split is not None
+        assert split.height == 4320
+        assert split.video_url == "https://x/v8k.webm"
+        assert split.audio_url == "https://x/a160.webm"
+        assert split.is_hls is False
+
+    def test_4k_cap_selects_2160(self):
+        split = _pick_video_split(self._info(), max_height=2160)
+        assert split is not None
+        assert split.height == 2160
+        assert split.video_url == "https://x/v4k.webm"
+
+    def test_1080_cap_selects_1080(self):
+        split = _pick_video_split(self._info(), max_height=1080)
+        assert split is not None
+        assert split.height == 1080
+        assert split.video_url == "https://x/v1080.mp4"
+
+    def test_720_cap_falls_to_merged(self):
+        split = _pick_video_split(self._info(), max_height=720)
+        assert split is not None
+        assert split.height == 360
+        assert split.video_url == "https://x/m.mp4"
+        assert split.audio_url is None
+
+    def test_mp4_preferred_on_resolution_tie(self):
+        info = {"formats": [
+            {"format_id": "v1", "vcodec": "vp9", "acodec": "none",
+             "height": 1080, "width": 1920, "ext": "webm",
+             "protocol": "https", "url": "https://x/v.webm"},
+            {"format_id": "v2", "vcodec": "avc1", "acodec": "none",
+             "height": 1080, "width": 1920, "ext": "mp4",
+             "protocol": "https", "url": "https://x/v.mp4"},
+            {"format_id": "a", "vcodec": "none", "acodec": "opus",
+             "abr": 128, "ext": "webm", "protocol": "https",
+             "url": "https://x/a.webm"},
+        ]}
+        split = _pick_video_split(info, 0)
+        assert split is not None
+        assert split.video_url == "https://x/v.mp4"
+
+    def test_hls_cap_excludes_everything_returns_none(self):
+        info = {"formats": [
+            {"format_id": "h1", "vcodec": "vp9", "acodec": "none",
+             "height": 2160, "protocol": "m3u8_native",
+             "url": "https://x/v2160.m3u8"},
+            {"format_id": "a1", "vcodec": "none", "acodec": "mp4a.40.2",
+             "abr": 128, "ext": "m4a", "protocol": "https",
+             "url": "https://x/a128.m4a"},
+        ]}
+        assert _pick_video_split(info, max_height=1080) is None
+
+    def test_hls_audio_used_when_no_progressive_audio(self):
+        info = {"formats": [
+            {"format_id": "h1", "vcodec": "vp9", "acodec": "none",
+             "height": 2160, "protocol": "m3u8_native",
+             "url": "https://x/v.m3u8"},
+            {"format_id": "ah1", "vcodec": "none", "acodec": "opus",
+             "abr": 160, "protocol": "m3u8_native",
+             "url": "https://x/a.m3u8"},
+        ]}
+        split = _pick_video_split(info, 2160)
+        assert split is not None
+        assert split.is_hls is True
+        assert split.audio_url == "https://x/a.m3u8"
+
+    def test_manifest_url_flagged_by_extension(self):
+        """A merged format whose URL is a playlist must not be treated
+        as progressive media."""
+        info = {"formats": [
+            {"format_id": "h1", "vcodec": "avc1", "acodec": "mp4a",
+             "height": 1080, "ext": "mp4", "protocol": "m3u8_native",
+             "url": "https://x/merged.m3u8"},
+        ]}
+        split = _pick_video_split(info, 0)
+        # The manifest is both video+audio, so it is not split into
+        # video-only/audio-only candidates; nothing progressive remains.
+        assert split is None or split.is_hls is True
+
+

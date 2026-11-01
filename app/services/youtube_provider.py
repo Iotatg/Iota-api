@@ -50,11 +50,6 @@ _TRANSCRIPT_CACHE_MAX = 100
 _TRANSCRIPT_LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
 _VTT_TS_RE = re.compile(r"(\d+:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?")
 _VTT_TAG_RE = re.compile(r"<[^>]+>")
-# YouTube serves video above this height only as separate
-# DASH streams (video-only + audio-only). At or below it a
-# single merged file is available, which is seekable and
-# needs no remux, so DASH is only worth it above this line.
-_MERGED_VIDEO_CEILING = 720
 
 
 def _resolve_ytdlp_argv() -> List[str]:
@@ -371,48 +366,110 @@ def _to_metadata(video_id: str, info: dict) -> MediaMetadata:
     )
 
 
-def _pick_dash_formats(
-    info: dict, max_height: int
-) -> Optional[Tuple[dict, dict]]:
-    """Select ``(video_only, audio_only)`` formats from a yt-dlp info dict.
+def _is_manifest_format(fmt: dict) -> bool:
+    """True when a format is a playlist/manifest rather than media bytes.
 
-    YouTube serves resolutions above 720p only as separate DASH
-    streams (a video-only stream plus a matching audio-only stream).
-    This picks the highest-resolution video-only stream — optionally
-    capped at ``max_height`` (``0`` means no cap, i.e. best available
-    up to 8K) — plus the highest-bitrate audio-only stream. Returns
-    ``None`` when the video exposes no separate DASH streams.
+    YouTube exposes adaptive streams in two shapes: a direct file URL
+    (progressive, fetchable byte-for-byte) and a manifest URL
+    (``m3u8``/``mpd``) that only describes a set of segments. The
+    manifest shapes carry the same ``url`` key, so they must be told
+    apart explicitly or a picker will happily "select" a 60 KB
+    playlist as if it were the video.
     """
-    formats = info.get("formats") or []
-    video_candidates: List[dict] = []
-    audio_candidates: List[dict] = []
-    for fmt in formats:
-        if not isinstance(fmt, dict) or not fmt.get("url"):
+    protocol = str(fmt.get("protocol") or "").lower()
+    if protocol in ("m3u8", "m3u8_native", "http_dash_segments", "dash"):
+        return True
+    ext = str(fmt.get("ext") or "").lower()
+    if ext in ("m3u8", "mpd"):
+        return True
+    url = str(fmt.get("url") or "").lower()
+    if ".m3u8" in url or ".mpd" in url:
+        return True
+    return bool(fmt.get("manifest_url"))
+
+
+def _manifest_url_of(fmt: dict) -> Optional[str]:
+    """The URL ffmpeg can open for a manifest format.
+
+    The format URL is preferred over ``manifest_url``: yt-dlp gives
+    the variant playlist (one resolution) as ``url`` and the master
+    playlist (all resolutions) as ``manifest_url``. Using the master
+    would hand the height choice back to ffmpeg and silently ignore
+    the requested cap.
+    """
+    for key in ("url", "manifest_url"):
+        value = fmt.get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    return None
+
+
+def _url_is_manifest(url: Optional[str]) -> bool:
+    """True when a resolved URL is a playlist, not media bytes."""
+    if not url:
+        return False
+    low = url.lower()
+    return ".m3u8" in low or ".mpd" in low or "manifest" in low
+
+
+@dataclass
+class _VideoSplit:
+    """A selected video representation for a download.
+
+    ``is_hls`` marks a manifest-based source that ffmpeg must remux;
+    otherwise ``video_url``/``audio_url`` are progressive files that
+    can be fetched byte-range style and muxed directly.
+    """
+
+    info: dict
+    video_url: str
+    audio_url: Optional[str]
+    height: int
+    is_hls: bool = False
+
+
+def _pick_video_split(
+    info: dict, max_height: int
+) -> Optional[_VideoSplit]:
+    """Choose the best video representation from a yt-dlp info dict.
+
+    Candidates, all filtered to ``height <= max_height`` (``0`` = no
+    cap):
+
+    - a progressive merged file (video+audio in one URL) — no remux;
+    - a progressive DASH pair (video-only + audio-only URLs) — remux;
+    - an HLS variant playlist (+ optional separate audio) — remux.
+
+    The highest resolution wins; ties prefer the cheaper delivery
+    (merged over DASH over HLS). Manifest URLs are only returned in
+    HLS mode — never handed out as if they were media files.
+    """
+    progressive_video: List[dict] = []
+    progressive_audio: List[dict] = []
+    merged: List[dict] = []
+    hls_video: List[dict] = []
+    hls_audio: List[dict] = []
+    for fmt in info.get("formats") or []:
+        if not isinstance(fmt, dict):
             continue
-        vcodec = str(fmt.get("vcodec") or "none")
-        acodec = str(fmt.get("acodec") or "none")
-        if vcodec != "none" and acodec == "none":
-            video_candidates.append(fmt)
-        elif acodec != "none" and vcodec == "none":
-            audio_candidates.append(fmt)
-    if not video_candidates or not audio_candidates:
-        return None
+        has_video = str(fmt.get("vcodec") or "none") != "none"
+        has_audio = str(fmt.get("acodec") or "none") != "none"
+        if _is_manifest_format(fmt):
+            # A manifest variant may carry its own audio track or be
+            # video-only; either way it is the video source.
+            if has_video:
+                hls_video.append(fmt)
+            elif has_audio:
+                hls_audio.append(fmt)
+        elif has_video and has_audio:
+            merged.append(fmt)
+        elif has_video:
+            progressive_video.append(fmt)
+        elif has_audio:
+            progressive_audio.append(fmt)
 
     def _res(f: dict) -> Tuple[int, int]:
         return (int(f.get("height") or 0), int(f.get("width") or 0))
-
-    pool = video_candidates
-    if max_height and max_height > 0:
-        capped = [f for f in pool if int(f.get("height") or 0) <= max_height]
-        if not capped:
-            # Nothing at or under the requested ceiling: no
-            # DASH representation fits, so the caller falls
-            # back to the merged (single-file) stream.
-            return None
-        pool = capped
-    # Highest resolution wins; on an exact tie prefer the mp4
-    # container (h.264) for the widest player compatibility.
-    video = max(pool, key=lambda f: (_res(f), f.get("ext") == "mp4"))
 
     def _abr(f: dict) -> int:
         for key in ("abr", "bitrate"):
@@ -421,8 +478,55 @@ def _pick_dash_formats(
                 return int(val)
         return 0
 
-    audio = max(audio_candidates, key=_abr)
-    return video, audio
+    def _cap(pool: List[dict]) -> List[dict]:
+        if not (max_height and max_height > 0):
+            return pool
+        return [f for f in pool if int(f.get("height") or 0) <= max_height]
+
+    # (height, delivery priority, is_hls, video_url, audio_url)
+    candidates: List[Tuple[int, int, bool, str, Optional[str]]] = []
+    for fmt in _cap(merged):
+        url = fmt.get("url")
+        if url:
+            candidates.append((_res(fmt)[0], 0, False, url, None))
+    capped_video = _cap(progressive_video)
+    if capped_video and progressive_audio:
+        video = max(capped_video, key=lambda f: (_res(f), f.get("ext") == "mp4"))
+        audio = max(progressive_audio, key=_abr)
+        vurl, aurl = video.get("url"), audio.get("url")
+        if vurl and aurl:
+            candidates.append((_res(video)[0], 1, False, vurl, aurl))
+    capped_hls = _cap(hls_video)
+    if capped_hls:
+        # Prefer variant playlists (m3u8_native) over master playlists
+        # so the height cap is exact instead of left to ffmpeg.
+        video = max(
+            capped_hls,
+            key=lambda f: (_res(f), f.get("protocol") == "m3u8_native"),
+        )
+        vurl = _manifest_url_of(video)
+        # A playlist that already carries an audio track needs no
+        # separate audio input.
+        playlist_has_audio = str(video.get("acodec") or "none") != "none"
+        audio: Optional[dict] = None
+        if not playlist_has_audio:
+            if progressive_audio:
+                audio = max(progressive_audio, key=_abr)
+            elif hls_audio:
+                audio = max(hls_audio, key=_abr)
+        aurl = audio.get("url") if audio else None
+        if vurl:
+            candidates.append((_res(video)[0], 2, True, vurl, aurl))
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda c: (c[0], -c[1]))
+    return _VideoSplit(
+        info=info,
+        video_url=best[3],
+        audio_url=best[4],
+        height=best[0],
+        is_hls=best[2],
+    )
 
 
 class YouTubeProvider(MediaProvider):
@@ -744,16 +848,18 @@ class YouTubeProvider(MediaProvider):
             return None
         return info, url
 
-    async def _ytdlp_video_dash(
+    async def _ytdlp_video_split(
         self, target: str, max_height: Optional[int] = None
-    ) -> Optional[Tuple[dict, str, str]]:
-        """Resolve the best DASH video + audio streams.
+    ) -> Optional[_VideoSplit]:
+        """Resolve the best video representation for a download.
 
-        One ``--dump-json`` call (no ``-f``) returns every
-        format; ``_pick_dash_formats`` then selects the best
-        video-only and audio-only streams for a high-quality
-        (1080p / 4K / 8K) download. Returns
-        ``(info, video_url, audio_url, video_height)``.
+        One ``--dump-json`` call (no ``-f``) returns every format;
+        ``_pick_video_split`` then chooses between a progressive
+        merged file, a progressive DASH pair (video-only +
+        audio-only, remuxed with ffmpeg by the caller) and an HLS
+        variant playlist (remuxed with ffmpeg). Only directly
+        fetchable media is returned for the non-HLS modes — a
+        manifest URL is never handed out as if it were a file.
         """
         if not self._ytdlp_argv:
             return None
@@ -781,15 +887,7 @@ class YouTubeProvider(MediaProvider):
             max_height = int(get_settings().youtube_video_max_height or 0)
         else:
             max_height = max(0, int(max_height))
-        picked = _pick_dash_formats(info, max_height)
-        if not picked:
-            return None
-        video_fmt, audio_fmt = picked
-        video_url = video_fmt.get("url")
-        audio_url = audio_fmt.get("url")
-        if not video_url or not audio_url:
-            return None
-        return info, video_url, audio_url, int(video_fmt.get("height") or 0)
+        return _pick_video_split(info, max_height)
 
     async def _ytdlp_search(self, query: str, limit: int) -> List[dict]:
         return await self._ytdlp_flat_entries(f"ytsearch{limit}:{query}")
@@ -906,32 +1004,31 @@ class YouTubeProvider(MediaProvider):
         kind = media_type if media_type in ("audio", "video") else "audio"
         mime_type = "video/mp4" if kind == "video" else "audio/mpeg"
         # High-quality video: YouTube serves resolutions above
-        # 720p only as separate DASH streams, so resolve the
-        # best video-only + audio-only pair. The caller remuxes
-        # them together with ffmpeg. DASH URLs are resolved
-        # fresh (not served from the stream cache) because the
-        # cached value is a merged single-file URL, which is a
-        # different representation.
+        # 720p only as separate DASH streams or HLS playlists, so
+        # resolve the best representation (merged file, DASH pair
+        # or HLS variant). The caller remuxes the split/HLS ones
+        # with ffmpeg. Split URLs are resolved fresh (not served
+        # from the stream cache) because the cached value is a
+        # merged single-file URL, a different representation.
         if kind == "video" and prefer_dash:
-            result = await self._ytdlp_video_dash(
+            split = await self._ytdlp_video_split(
                 self._watch_url(video_id), max_height=max_height
             )
-            # DASH only pays off when the best video-only
-            # stream is above the merged (single-file)
-            # ceiling; at or below it the merged stream is
-            # seekable and needs no remux, so fall through
-            # to the merged path below.
-            if result is not None and result[3] > _MERGED_VIDEO_CEILING:
-                info, video_url, audio_url, _height = result
-                meta = _to_metadata(video_id, info)
+            # ``_pick_video_split`` already prefers a merged file when
+            # it matches the best available resolution, so a split
+            # result means a higher resolution exists than any single
+            # file can offer. Remuxing it is what buys 1080p/4K.
+            if split is not None and (split.is_hls or split.audio_url):
+                meta = _to_metadata(video_id, split.info)
                 self._cache_put(video_id, meta)
                 return StreamSource(
                     storage_key="",
                     size_bytes=0,  # size is only known after the merge
                     mime_type=mime_type,
-                    direct_url=video_url,
-                    direct_url_audio=audio_url,
-                    is_dash=True,
+                    direct_url=split.video_url,
+                    direct_url_audio=split.audio_url,
+                    is_dash=not split.is_hls,
+                    is_hls=split.is_hls,
                 )
         # Cache hit: reuse the resolved CDN URL and metadata,
         # skipping the multi-second yt-dlp extraction. The key
@@ -943,11 +1040,16 @@ class YouTubeProvider(MediaProvider):
         if cached is not None:
             url, meta = cached
             self._cache_put(video_id, meta)
+            # Some videos resolve their best merged representation
+            # as an HLS playlist. Proxying a playlist as if it were
+            # the media file hands the client a 60 KB text file, so
+            # flag it for the download route to remux instead.
             return StreamSource(
                 storage_key="",
                 size_bytes=0,  # unknown until upstream is HEAD-probed
                 mime_type=mime_type,
                 direct_url=url,
+                is_hls=_url_is_manifest(url),
             )
         result = await self._ytdlp_info_and_url(
             self._watch_url(video_id), media_type=kind
@@ -967,6 +1069,7 @@ class YouTubeProvider(MediaProvider):
             size_bytes=0,  # unknown until upstream is HEAD-probed
             mime_type=mime_type,
             direct_url=url,
+            is_hls=_url_is_manifest(url),
         )
 
     # ── Native failover: player-client rotation ─────────────────────

@@ -2,6 +2,22 @@
 import pytest
 
 
+def _isolate_merge_cache(monkeypatch, tmp_path):
+    """Keep merged-video results out of the shared repo cache dir.
+
+    The merge cache is a disk directory keyed by media id + height;
+    without isolation one test's merge would be served to the next
+    one and the working tree would collect multi-MB artifacts.
+    """
+    import app.routes.download as dl
+    from app.config import get_settings
+
+    settings = get_settings().model_copy(
+        update={"video_merge_cache_dir": str(tmp_path / "merge-cache")}
+    )
+    monkeypatch.setattr(dl, "get_settings", lambda: settings)
+
+
 @pytest.mark.asyncio
 async def test_download_full_body(client, created_key):
     r = await client.get(
@@ -96,7 +112,7 @@ async def test_download_unsatisfiable_range(client, created_key):
 
 @pytest.mark.asyncio
 async def test_download_dash_video_merges_and_streams(
-    client, created_key, app_instance, monkeypatch
+    client, created_key, app_instance, monkeypatch, tmp_path
 ):
     """kind=video with a DASH source: the route remuxes the
     two streams into a temp file via ffmpeg, serves it
@@ -108,6 +124,7 @@ async def test_download_dash_video_merges_and_streams(
     import app.routes.download as dl
     from app.services.media_provider import StreamSource
 
+    _isolate_merge_cache(monkeypatch, tmp_path)
     provider = app_instance.state.provider
     dash_src = StreamSource(
         storage_key="",
@@ -148,7 +165,7 @@ async def test_download_dash_video_merges_and_streams(
 
 @pytest.mark.asyncio
 async def test_download_dash_video_with_range(
-    client, created_key, app_instance, monkeypatch
+    client, created_key, app_instance, monkeypatch, tmp_path
 ):
     """A DASH download honours Range requests (the merged
     temp file is served like any other seekable file)."""
@@ -159,6 +176,7 @@ async def test_download_dash_video_with_range(
     import app.routes.download as dl
     from app.services.media_provider import StreamSource
 
+    _isolate_merge_cache(monkeypatch, tmp_path)
     provider = app_instance.state.provider
     dash_src = StreamSource(
         storage_key="",
@@ -377,3 +395,222 @@ async def test_download_max_height_bounds_validated(client, created_key):
         params={"key": created_key["api_key"], "kind": "video", "max_height": 99999},
     )
     assert r.status_code == 422
+
+
+class TestEffectiveVideoHeight:
+    """The requested height must reach the provider *before* the
+    stream is resolved, and an explicit 4K request must survive."""
+
+    @staticmethod
+    def _capture(provider, height=2160):
+        from unittest.mock import AsyncMock
+        from app.services.media_provider import StreamSource
+
+        seen = {}
+
+        async def fake(media_id, kind, prefer_dash=False, max_height=None):
+            seen["kind"] = kind
+            seen["prefer_dash"] = prefer_dash
+            seen["max_height"] = max_height
+            return StreamSource(
+                storage_key="sample-001.mp3",
+                size_bytes=4608,
+                mime_type="video/mp4",
+            )
+
+        provider.get_stream_by_type = fake
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_default_height_is_720(self, client, created_key, app_instance):
+        provider = app_instance.state.provider
+        seen = self._capture(provider)
+        await client.get(
+            "/download/sample-001.mp3",
+            params={"key": created_key["api_key"], "kind": "video"},
+        )
+        assert seen["max_height"] == 720
+        assert seen["prefer_dash"] is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_4k_request_is_honoured(
+        self, client, created_key, app_instance
+    ):
+        provider = app_instance.state.provider
+        seen = self._capture(provider)
+        await client.get(
+            "/download/sample-001.mp3",
+            params={
+                "key": created_key["api_key"],
+                "kind": "video",
+                "max_height": 2160,
+            },
+        )
+        assert seen["max_height"] == 2160
+
+    @pytest.mark.asyncio
+    async def test_request_above_hard_cap_is_clamped(
+        self, client, created_key, app_instance
+    ):
+        provider = app_instance.state.provider
+        seen = self._capture(provider)
+        await client.get(
+            "/download/sample-001.mp3",
+            params={
+                "key": created_key["api_key"],
+                "kind": "video",
+                "max_height": 4320,
+            },
+        )
+        assert seen["max_height"] == 2160
+
+    @pytest.mark.asyncio
+    async def test_audio_is_not_height_capped(
+        self, client, created_key, app_instance
+    ):
+        provider = app_instance.state.provider
+        seen = self._capture(provider)
+        await client.get(
+            "/download/sample-001.mp3",
+            params={"key": created_key["api_key"], "kind": "audio"},
+        )
+        assert seen["max_height"] is None
+
+
+class TestHlsVideoDownload:
+    """An HLS playlist carries no media bytes: the route must remux it
+    into a real MP4 instead of proxying the text manifest."""
+
+    @pytest.mark.asyncio
+    async def test_hls_source_is_remuxed_and_served(
+        self, client, created_key, app_instance, monkeypatch, tmp_path
+    ):
+        import os
+        import tempfile
+        from unittest.mock import AsyncMock
+
+        import app.routes.download as dl
+        from app.services.media_provider import StreamSource
+
+        _isolate_merge_cache(monkeypatch, tmp_path)
+        provider = app_instance.state.provider
+        provider.get_stream_by_type = AsyncMock(return_value=StreamSource(
+            storage_key="",
+            size_bytes=0,
+            mime_type="video/mp4",
+            direct_url="https://cdn.up.test/variant2160.m3u8",
+            direct_url_audio="https://cdn.up.test/audio.m4a",
+            is_hls=True,
+        ))
+
+        payload = b"FAKEREMUX" * 256
+        created = []
+
+        async def fake_merge(video_url, audio_url):
+            assert video_url == "https://cdn.up.test/variant2160.m3u8"
+            assert audio_url == "https://cdn.up.test/audio.m4a"
+            fd, path = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            with open(path, "wb") as fh:
+                fh.write(payload)
+            created.append(path)
+            return path
+
+        monkeypatch.setattr(dl, "_merge_hls_to_temp", fake_merge)
+
+        r = await client.get(
+            "/download/yt:abc123",
+            params={"key": created_key["api_key"], "kind": "video"},
+        )
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("video/mp4")
+        assert r.headers["accept-ranges"] == "bytes"
+        assert r.content == payload
+        assert created and not os.path.exists(created[0])
+
+    @pytest.mark.asyncio
+    async def test_manifest_direct_url_is_not_proxied(
+        self, client, created_key, app_instance, monkeypatch, tmp_path
+    ):
+        """A playlist URL that arrives without the is_hls flag must
+        still be remuxed, never proxied as the media file."""
+        import os
+        import tempfile
+        from unittest.mock import AsyncMock
+
+        import app.routes.download as dl
+        from app.services.media_provider import StreamSource
+
+        _isolate_merge_cache(monkeypatch, tmp_path)
+        provider = app_instance.state.provider
+        provider.get_stream_by_type = AsyncMock(return_value=StreamSource(
+            storage_key="",
+            size_bytes=0,
+            mime_type="video/mp4",
+            direct_url="https://cdn.up.test/merged.m3u8",
+        ))
+
+        payload = b"FAKEREMUX" * 256
+
+        async def fake_merge(video_url, audio_url):
+            assert audio_url is None
+            fd, path = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            with open(path, "wb") as fh:
+                fh.write(payload)
+            return path
+
+        monkeypatch.setattr(dl, "_merge_hls_to_temp", fake_merge)
+
+        r = await client.get(
+            "/download/yt:abc123",
+            params={"key": created_key["api_key"], "kind": "video"},
+        )
+        assert r.status_code == 200
+        assert r.content == payload
+
+    @pytest.mark.asyncio
+    async def test_hls_head_reports_no_size(
+        self, client, created_key, app_instance, monkeypatch, tmp_path
+    ):
+        """A HEAD must not trigger the remux, and the merged length is
+        unknown until it runs."""
+        from unittest.mock import AsyncMock
+
+        import app.routes.download as dl
+        from app.services.media_provider import StreamSource
+
+        _isolate_merge_cache(monkeypatch, tmp_path)
+        provider = app_instance.state.provider
+        provider.get_stream_by_type = AsyncMock(return_value=StreamSource(
+            storage_key="",
+            size_bytes=0,
+            mime_type="video/mp4",
+            direct_url="https://cdn.up.test/variant2160.m3u8",
+            is_hls=True,
+        ))
+
+        called = []
+
+        async def fake_merge(video_url, audio_url):
+            called.append(video_url)
+            raise AssertionError("HEAD must not remux")
+
+        monkeypatch.setattr(dl, "_merge_hls_to_temp", fake_merge)
+
+        r = await client.head(
+            "/download/yt:abc123",
+            params={"key": created_key["api_key"], "kind": "video"},
+        )
+        assert r.status_code == 200
+        assert "content-length" not in r.headers
+        assert r.headers["accept-ranges"] == "none"
+        assert not called
+
+
+def test_url_is_manifest_detects_playlists():
+    from app.routes.download import _url_is_manifest
+    assert _url_is_manifest("https://x/v.m3u8?sig=1") is True
+    assert _url_is_manifest("https://x/v.mpd") is True
+    assert _url_is_manifest("https://x/video.mp4") is False
+    assert _url_is_manifest(None) is False
