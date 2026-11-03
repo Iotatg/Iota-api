@@ -230,3 +230,37 @@ class TestStreamParallel:
 
         with pytest.raises((ProviderUnavailableError, httpx.HTTPError)):
             asyncio.get_event_loop().run_until_complete(collect())
+
+
+class TestFetchToTemp:
+    def test_fetch_to_temp_writes_full_body(self, tmp_path):
+        import asyncio
+        import os
+
+        body = b"FETCHME" * 64
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "HEAD":
+                return _make_response(200, {
+                    "content-length": str(len(body)),
+                    "accept-ranges": "bytes",
+                    "content-type": "audio/mpeg",
+                })
+            rng = request.headers.get("range", "bytes=0-")
+            s, e = (int(x) for x in rng.split("=")[1].split("-"))
+            e = min(e, len(body) - 1)
+            return _make_response(206, {
+                "content-length": str(e - s + 1),
+                "content-range": f"bytes {s}-{e}/{len(body)}",
+                "content-type": "audio/mpeg",
+            }, body=body[s:e + 1])
+
+        proxy = StreamProxy(client=_client(handler))
+        path = asyncio.get_event_loop().run_until_complete(
+            proxy.fetch_to_temp("https://up.test/a.m4a", workers=2, chunk_size=32)
+        )
+        try:
+            with open(path, "rb") as fh:
+                assert fh.read() == body
+        finally:
+            os.unlink(path)

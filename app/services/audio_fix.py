@@ -9,12 +9,13 @@ form:
 
 - ``m4a``: bit-exact remux into progressive MP4 with the index at the
   front (``+faststart``), so seekable players stream instantly.
-- ``mp3``: libmp3lame transcode, the most compatible format of all.
+- ``mp3``: libmp3lame CBR transcode (default 192 kbps), the most
+  compatible format of all.
 
 Repaired files land in the storage backend under ``fixed/`` and are
-built once per track (per-key asyncio lock, FIFO eviction so the disk
-stays bounded). Any failure falls back to the original stream — the
-repair is strictly best-effort.
+built once per track + bitrate (per-key asyncio lock, FIFO eviction
+so the disk stays bounded). Any failure falls back to the original
+stream — the repair is strictly best-effort.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import tempfile
 from collections import deque
 from typing import Dict, Optional
 
+from app.config import get_settings
 from app.services.media_provider import StreamSource
 from app.utils.logging import get_logger
 
@@ -34,31 +36,75 @@ FIX_FORMATS = ("m4a", "mp3")
 FIX_MIME = {"m4a": "audio/mp4", "mp3": "audio/mpeg"}
 
 _FFMPEG_TIMEOUT = 180.0
-_UA = "Mozilla/5.0 (compatible; iota-api)"
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 _KEEP_FIXED = 30
 _locks: Dict[str, asyncio.Lock] = {}
 _recent: deque = deque()
 
+_MIN_BITRATE = 64
+_MAX_BITRATE = 320
 
-def _ffmpeg_args(fmt: str, url: str, out_path: str) -> list:
-    base = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-user_agent", _UA,
-        "-headers", "Referer: https://www.youtube.com/\r\n",
-        "-i", url,
-    ]
+
+def clamp_mp3_bitrate(bitrate: Optional[int]) -> int:
+    """Return a CBR kbps in 64–320; default from settings."""
+    default = get_settings().audio_mp3_bitrate
+    if bitrate is None:
+        return default
+    try:
+        value = int(bitrate)
+    except (TypeError, ValueError):
+        return default
+    return max(_MIN_BITRATE, min(_MAX_BITRATE, value))
+
+
+def _safe_tag(value: str) -> str:
+    return (value or "").replace("\r", " ").replace("\n", " ").strip()[:200]
+
+
+def _ffmpeg_args(
+    fmt: str,
+    url: str,
+    out_path: str,
+    bitrate: Optional[int] = None,
+    title: Optional[str] = None,
+    artist: Optional[str] = None,
+) -> list:
+    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if url.startswith("http://") or url.startswith("https://"):
+        base += [
+            "-user_agent", _UA,
+            "-headers", "Referer: https://www.youtube.com/\r\n",
+        ]
+    base += ["-i", url]
     if fmt == "m4a":
         return base + ["-vn", "-c:a", "copy", "-movflags", "+faststart",
                        "-f", "mp4", out_path]
-    return base + ["-vn", "-c:a", "libmp3lame", "-q:a", "2",
-                   "-f", "mp3", out_path]
+    kbps = clamp_mp3_bitrate(bitrate)
+    args = base + ["-vn", "-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+    if title:
+        args += ["-metadata", f"title={_safe_tag(title)}"]
+    if artist:
+        args += ["-metadata", f"artist={_safe_tag(artist)}"]
+    return args + ["-f", "mp3", out_path]
 
 
-async def _ffmpeg(fmt: str, url: str, out_path: str) -> Optional[str]:
+async def _ffmpeg(
+    fmt: str,
+    url: str,
+    out_path: str,
+    bitrate: Optional[int] = None,
+    title: Optional[str] = None,
+    artist: Optional[str] = None,
+) -> Optional[str]:
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_ffmpeg_args(fmt, url, out_path),
+            *_ffmpeg_args(
+                fmt, url, out_path, bitrate=bitrate, title=title, artist=artist,
+            ),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -73,28 +119,49 @@ async def _ffmpeg(fmt: str, url: str, out_path: str) -> Optional[str]:
     return None
 
 
-def fixed_key(media_id: str, fmt: str) -> str:
+def fixed_key(media_id: str, fmt: str, bitrate: Optional[int] = None) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in media_id)
+    if fmt == "mp3":
+        kbps = clamp_mp3_bitrate(bitrate)
+        return f"fixed/{safe}-{fmt}-{kbps}.{fmt}"
     return f"fixed/{safe}-{fmt}.{fmt}"
 
 
 async def ensure_fixed_source(
-    storage, media_id: str, src: StreamSource, fmt: str
+    storage,
+    media_id: str,
+    src: StreamSource,
+    fmt: str,
+    bitrate: Optional[int] = None,
+    stream_proxy=None,
+    workers: int = 4,
+    title: Optional[str] = None,
+    artist: Optional[str] = None,
 ) -> Optional[StreamSource]:
     """Return a storage-backed StreamSource for the repaired audio, or
     None when the repair cannot be done (caller keeps the original)."""
     if fmt not in FIX_FORMATS or not src.direct_url:
         return None
-    key = fixed_key(media_id, fmt)
+    key = fixed_key(media_id, fmt, bitrate=bitrate)
     if key not in _locks:
         _locks[key] = asyncio.Lock()
     async with _locks[key]:
         if not await storage.exists(key):
             fd, tmp = tempfile.mkstemp(suffix=f".{fmt}")
             os.close(fd)
+            local = None
             ok = False
             try:
-                err = await _ffmpeg(fmt, src.direct_url, tmp)
+                ffmpeg_input = src.direct_url
+                if stream_proxy is not None:
+                    local = await stream_proxy.fetch_to_temp(
+                        src.direct_url, workers=workers,
+                    )
+                    ffmpeg_input = local
+                err = await _ffmpeg(
+                    fmt, ffmpeg_input, tmp,
+                    bitrate=bitrate, title=title, artist=artist,
+                )
                 if not err and os.path.getsize(tmp) > 0:
                     await storage.put(key, tmp)
                     ok = True
@@ -108,6 +175,9 @@ async def ensure_fixed_source(
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(tmp)
+                if local:
+                    with contextlib.suppress(OSError):
+                        os.remove(local)
             if not ok:
                 return None
             _recent.append(key)

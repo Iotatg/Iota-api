@@ -43,6 +43,7 @@ from app.dependencies import (
 )
 from app.models.api_key import APIKey
 from app.services import mirror_store
+from app.services.audio_fix import clamp_mp3_bitrate, ensure_fixed_source
 from app.services.media_provider import (
     MediaNotFoundError,
     MediaProvider,
@@ -124,43 +125,11 @@ async def _fetch_url_to_temp(
     workers: int,
     chunk_size: int = 65536,
 ) -> str:
-    """Fetch ``url`` to a local temp file, splitting the
-    download across several concurrent Range requests.
-
-    A single CDN connection is often throttled to a few
-    hundred KB/s; the same parallel technique the stream
-    endpoint uses lifts aggregate throughput to several
-    MB/s. The caller deletes the file."""
-    head = await stream_proxy.head(url)
-    size = head.size_bytes
-    fd, path = tempfile.mkstemp()
-    os.close(fd)
-    loop = asyncio.get_running_loop()
-    try:
-        with open(path, "wb") as handle:
-            if head.supports_range:
-                stream_iter = stream_proxy.stream_parallel(
-                    url, start=0, end=size - 1,
-                    chunk_size=chunk_size, workers=workers,
-                )
-            else:
-                stream_iter = stream_proxy.stream(
-                    url, start=0, end=size - 1,
-                    chunk_size=chunk_size,
-                )
-            buffer = bytearray()
-            async for chunk in stream_iter:
-                buffer.extend(chunk)
-                if len(buffer) >= 1024 * 1024:
-                    await loop.run_in_executor(None, handle.write, bytes(buffer))
-                    buffer.clear()
-            if buffer:
-                await loop.run_in_executor(None, handle.write, bytes(buffer))
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(path)
-        raise
-    return path
+    """Fetch ``url`` to a local temp file via the cookie-bearing
+    parallel Range proxy. The caller deletes the file."""
+    return await stream_proxy.fetch_to_temp(
+        url, workers=workers, chunk_size=chunk_size,
+    )
 
 
 async def _merge_dash_to_temp(
@@ -406,20 +375,36 @@ async def _serve_mp3(
     api_key: APIKey,
     rate_limiter: RateLimiter,
     session: AsyncSession,
+    storage: StorageService,
+    stream_proxy: StreamProxy,
     src: StreamSource,
     method: str,
     started: float,
+    range_header: Optional[str],
+    bitrate: Optional[int],
 ):
-    """Download-only MP3: transcode the upstream audio
-    to MP3 on the fly with ID3 title/artist tags and
-    stream it straight from ffmpeg. No bytes are written
-    to disk or cached. Because the output size is only
-    known after a full transcode, the response is chunked
-    (no Content-Length) and Range is not supported; m4a
-    stays the seekable representation for /stream/."""
+    """MP3 download: transcode (CBR, default 192 kbps) into storage,
+    then serve Range-capable from the cached file. Repeat hits skip
+    ffmpeg entirely. ID3 title/artist tags are written on first build."""
     settings = get_settings()
+    kbps = clamp_mp3_bitrate(bitrate)
     title, artist = await _metadata_for(provider, media_id)
     filename = f"{_safe_filename(title, media_id)}.mp3"
+
+    fixed = await ensure_fixed_source(
+        storage, media_id, src, "mp3",
+        bitrate=kbps,
+        stream_proxy=stream_proxy,
+        workers=settings.stream_parallel_workers,
+        title=title,
+        artist=artist,
+    )
+    if fixed is None or not await storage.exists(fixed.storage_key):
+        raise HTTPException(status_code=502, detail={
+            "error": "upstream_unavailable",
+            "detail": "ffmpeg mp3 transcode failed.",
+        })
+    size = await storage.size(fixed.storage_key)
 
     touch(api_key)
     api_key.total_requests += 1
@@ -431,17 +416,31 @@ async def _serve_mp3(
         time.perf_counter() - started
     )
 
+    start, end, status_code, content_range = 0, size - 1, 200, None
+    if range_header:
+        parsed = _parse_range(range_header, size)
+        if parsed is not None:
+            start, end = parsed
+            status_code = 206
+            content_range = f"bytes {start}-{end}/{size}"
+    content_length = end - start + 1
+
     headers = {
+        "Accept-Ranges": "bytes",
         "Content-Type": "audio/mpeg",
+        "Content-Length": str(content_length),
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
         "Content-Disposition": _content_disposition(filename),
+        "X-Audio-Bitrate": str(kbps),
     }
+    if content_range:
+        headers["Content-Range"] = content_range
+
     if method == "HEAD":
-        # A HEAD cannot know the size without a full
-        # transcode, so it reports the content type only.
         return StreamingResponse(
-            iter(()), status_code=200, headers=headers, media_type="audio/mpeg",
+            iter(()), status_code=status_code, headers=headers,
+            media_type="audio/mpeg",
         )
 
     token = await rate_limiter.acquire_stream(
@@ -455,60 +454,15 @@ async def _serve_mp3(
         )
     active_streams.inc()
 
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", src.direct_url,
-        "-c:a", "libmp3lame", "-q:a", "2",
-        "-metadata", f"title={title}",
-        "-metadata", f"artist={artist}",
-        "-f", "mp3", "pipe:1",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    # Buffer the first chunk so an immediate upstream or
-    # ffmpeg failure surfaces as a 502 rather than an
-    # empty 200 body.
-    try:
-        first = await asyncio.wait_for(
-            proc.stdout.read(settings.stream_chunk_size), timeout=30.0
-        )
-    except asyncio.TimeoutError:
-        with contextlib.suppress(Exception):
-            proc.kill()
-        await proc.wait()
-        await rate_limiter.release_stream(api_key.id, token)
-        active_streams.dec()
-        raise HTTPException(status_code=504, detail={
-            "error": "upstream_timeout",
-            "detail": "ffmpeg mp3 transcode timed out.",
-        })
-    if not first:
-        _, stderr = await proc.communicate()
-        await rate_limiter.release_stream(api_key.id, token)
-        active_streams.dec()
-        raise HTTPException(status_code=502, detail={
-            "error": "upstream_unavailable",
-            "detail": f"ffmpeg mp3 transcode failed: {stderr.decode(errors='ignore')[-400:]}",
-        })
-
     async def mp3_body() -> AsyncIterator[bytes]:
-        sent = len(first)
+        sent = 0
         try:
-            yield first
-            while True:
-                chunk = await proc.stdout.read(settings.stream_chunk_size)
-                if not chunk:
-                    break
+            async for chunk in storage.open_stream(
+                fixed.storage_key, start=start, end=end
+            ):
                 sent += len(chunk)
                 yield chunk
-            await proc.wait()
         finally:
-            if proc.returncode is None:
-                with contextlib.suppress(Exception):
-                    proc.kill()
             stream_bytes_total.labels(endpoint="download").inc(sent)
             active_streams.dec()
             await rate_limiter.release_stream(api_key.id, token)
@@ -523,12 +477,13 @@ async def _serve_mp3(
                 "kind": "audio",
                 "bytes": sent,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
-                "status": 200,
-                "source": "mp3_transcode",
+                "status": status_code,
+                "source": "mp3_cache",
             })
 
     return StreamingResponse(
-        mp3_body(), status_code=200, headers=headers, media_type="audio/mpeg",
+        mp3_body(), status_code=status_code, headers=headers,
+        media_type="audio/mpeg",
     )
 
 
@@ -538,6 +493,10 @@ async def download_get(
     media_id: str,
     kind: str = Query("audio", description="audio or video"),
     fmt: Optional[str] = Query(default=None, alias="format", description="original or mp3"),
+    bitrate: Optional[int] = Query(
+        default=None, ge=64, le=320,
+        description="MP3 CBR kbps (64-320); only used with format=mp3",
+    ),
     max_height: Optional[int] = Query(
         default=None, ge=1, le=4320,
         description="cap video resolution height (e.g. 1080) for DASH video",
@@ -555,6 +514,7 @@ async def download_get(
         media_id=media_id,
         kind=kind,
         format_param=fmt,
+        bitrate=bitrate,
         max_height=max_height,
         range_header=range_header,
         api_key=api_key,
@@ -573,6 +533,10 @@ async def download_head(
     media_id: str,
     kind: str = Query("audio", description="audio or video"),
     fmt: Optional[str] = Query(default=None, alias="format", description="original or mp3"),
+    bitrate: Optional[int] = Query(
+        default=None, ge=64, le=320,
+        description="MP3 CBR kbps (64-320); only used with format=mp3",
+    ),
     max_height: Optional[int] = Query(
         default=None, ge=1, le=4320,
         description="cap video resolution height (e.g. 1080) for DASH video",
@@ -592,6 +556,7 @@ async def download_head(
         media_id=media_id,
         kind=kind,
         format_param=fmt,
+        bitrate=bitrate,
         max_height=max_height,
         range_header=range_header,
         api_key=api_key,
@@ -609,6 +574,7 @@ async def _do_download(
     media_id: str,
     kind: str,
     format_param: Optional[str],
+    bitrate: Optional[int],
     max_height: Optional[int],
     range_header: Optional[str],
     api_key: APIKey,
@@ -692,7 +658,9 @@ async def _do_download(
         return await _serve_mp3(
             provider=provider, media_id=media_id, api_key=api_key,
             rate_limiter=rate_limiter, session=session,
+            storage=storage, stream_proxy=stream_proxy,
             src=src, method=method, started=started,
+            range_header=range_header, bitrate=bitrate,
         )
 
     # ── 3. Resolve size + decide storage vs proxy vs dash/hls path ──

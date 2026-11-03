@@ -39,7 +39,7 @@ from app.services.media_provider import (
     ProviderUnavailableError,
 )
 from app.services.storage import ObjectNotFoundError, StorageService
-from app.services.audio_fix import FIX_FORMATS, ensure_fixed_source
+from app.services.audio_fix import FIX_FORMATS, clamp_mp3_bitrate, ensure_fixed_source
 from app.services.stream_fallback import relay_source
 from app.services.stream_proxy import StreamProxy
 from app.utils.logging import get_logger
@@ -147,8 +147,11 @@ async def stream_get(
     range_header: Optional[str] = Header(default=None, alias="Range"),
     audio_format: Optional[str] = Query(
         None, alias="format",
-        description="m4a: progressive MP4 remux; mp3: transcode — "
+        description="m4a: progressive MP4 remux; mp3: CBR transcode — "
                     "universally inline-playable formats"),
+    bitrate: Optional[int] = Query(
+        None, ge=64, le=320,
+        description="MP3 CBR kbps (64-320); only used with format=mp3"),
     api_key: APIKey = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
@@ -161,6 +164,7 @@ async def stream_get(
         media_id=media_id,
         range_header=range_header,
         fmt=audio_format,
+        bitrate=bitrate,
         api_key=api_key,
         session=session,
         rate_limiter=rate_limiter,
@@ -178,8 +182,11 @@ async def stream_head(
     range_header: Optional[str] = Header(default=None, alias="Range"),
     audio_format: Optional[str] = Query(
         None, alias="format",
-        description="m4a: progressive MP4 remux; mp3: transcode — "
+        description="m4a: progressive MP4 remux; mp3: CBR transcode — "
                     "universally inline-playable formats"),
+    bitrate: Optional[int] = Query(
+        None, ge=64, le=320,
+        description="MP3 CBR kbps (64-320); only used with format=mp3"),
     api_key: APIKey = Depends(require_api_key),
     session: AsyncSession = Depends(get_session),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
@@ -194,6 +201,7 @@ async def stream_head(
         media_id=media_id,
         range_header=range_header,
         fmt=audio_format,
+        bitrate=bitrate,
         api_key=api_key,
         session=session,
         rate_limiter=rate_limiter,
@@ -209,6 +217,7 @@ async def _do_stream(
     media_id: str,
     range_header: Optional[str],
     fmt: Optional[str],
+    bitrate: Optional[int],
     api_key: APIKey,
     session: AsyncSession,
     rate_limiter: RateLimiter,
@@ -260,7 +269,12 @@ async def _do_stream(
     # A non-empty direct_url means the provider has a remote URL we must
     # proxy; otherwise the bytes are in the local/S3 storage backend.
     if src.direct_url and fmt and fmt.lower() in FIX_FORMATS:
-        fixed = await ensure_fixed_source(storage, media_id, src, fmt.lower())
+        fixed = await ensure_fixed_source(
+            storage, media_id, src, fmt.lower(),
+            bitrate=bitrate,
+            stream_proxy=stream_proxy,
+            workers=settings.stream_parallel_workers,
+        )
         if fixed is not None:
             src = fixed
 
@@ -369,6 +383,8 @@ async def _do_stream(
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
         }
+        if fmt and fmt.lower() == "mp3":
+            headers["X-Audio-Bitrate"] = str(clamp_mp3_bitrate(bitrate))
         if content_length is not None:
             headers["Content-Length"] = str(content_length)
         if content_range:

@@ -19,9 +19,11 @@ route returns a structured 502/503.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.cookiejar
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional, Tuple
 
@@ -342,3 +344,51 @@ class StreamProxy:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def fetch_to_temp(
+        self,
+        url: str,
+        workers: int = _PARALLEL_WORKERS,
+        chunk_size: int = 65536,
+    ) -> str:
+        """Download ``url`` to a temp file (parallel Range when possible).
+
+        googlevideo throttles a single connection; splitting the fetch
+        through the same cookie-bearing client ffmpeg cannot use lifts
+        throughput and avoids 403s that a bare ffmpeg GET would hit.
+        The caller owns and must delete the returned path.
+        """
+        head = await self.head(url)
+        size = head.size_bytes
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        loop = asyncio.get_running_loop()
+        try:
+            with open(path, "wb") as handle:
+                if head.supports_range and size > 0:
+                    stream_iter = self.stream_parallel(
+                        url, start=0, end=size - 1,
+                        chunk_size=chunk_size, workers=workers,
+                    )
+                else:
+                    end = size - 1 if size > 0 else None
+                    stream_iter = self.stream(
+                        url, start=0, end=end, chunk_size=chunk_size,
+                    )
+                buffer = bytearray()
+                async for chunk in stream_iter:
+                    buffer.extend(chunk)
+                    if len(buffer) >= 1024 * 1024:
+                        await loop.run_in_executor(
+                            None, handle.write, bytes(buffer)
+                        )
+                        buffer.clear()
+                if buffer:
+                    await loop.run_in_executor(
+                        None, handle.write, bytes(buffer)
+                    )
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            raise
+        return path

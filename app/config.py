@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     # short TTL lets repeat plays of the same song skip the
     # multi-second yt-dlp extraction. Stale URLs are re-resolved
     # automatically on the next request.
-    stream_cache_ttl: int = 120
+    stream_cache_ttl: int = 600
     # How long a resolved stream URL is cached in the
     # persistent database (survives a restart). YouTube
     # CDN URLs are valid for hours, so this can be much
@@ -125,6 +125,10 @@ class Settings(BaseSettings):
     # 4K (``?max_height=2160``) is served up to this height; larger
     # values are clamped instead of rejected so clients do not break.
     video_max_height_hard_cap: int = 2160
+    # Default MP3 transcode bitrate (CBR kbps) for ``?format=mp3``.
+    # Baby serves 192 kbps; matching it is the quality floor. Clients
+    # may override with ``?bitrate=`` in 64–320.
+    audio_mp3_bitrate: int = 192
 
     # ── Demo provider ─────────────────────────────────────────────────────
     demo_audio_dir: str = "./storage/audio"
@@ -228,6 +232,13 @@ class Settings(BaseSettings):
     def _validate_chunk_size(cls, v: int) -> int:
         if v < 4096 or v > 1_048_576:
             raise ValueError("STREAM_CHUNK_SIZE must be between 4096 and 1048576 bytes.")
+        return v
+
+    @field_validator("audio_mp3_bitrate")
+    @classmethod
+    def _validate_mp3_bitrate(cls, v: int) -> int:
+        if v < 64 or v > 320:
+            raise ValueError("AUDIO_MP3_BITRATE must be between 64 and 320.")
         return v
 
 

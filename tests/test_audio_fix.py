@@ -10,6 +10,7 @@ from app.services.audio_fix import (
     FIX_MIME,
     _ffmpeg,
     _ffmpeg_args,
+    clamp_mp3_bitrate,
     ensure_fixed_source,
     fixed_key,
 )
@@ -40,8 +41,8 @@ def _src(url="https://x/y"):
 def _patch_ok(monkeypatch, payload=b"AUDIO"):
     calls = []
 
-    async def fake(fmt, url, out_path):
-        calls.append((fmt, url))
+    async def fake(fmt, url, out_path, bitrate=None, title=None, artist=None):
+        calls.append((fmt, url, bitrate))
         with open(out_path, "wb") as fh:
             fh.write(payload)
         return None
@@ -55,7 +56,27 @@ def test_ffmpeg_args_by_format():
     assert "copy" in m4a and "libmp3lame" not in m4a
     mp3 = _ffmpeg_args("mp3", "u", "o.mp3")
     assert "libmp3lame" in mp3 and "faststart" not in " ".join(mp3)
+    assert "-b:a" in mp3 and "192k" in mp3
+    assert "-q:a" not in mp3
     assert "-i" in m4a and m4a[m4a.index("-i") + 1] == "u"
+    tagged = _ffmpeg_args("mp3", "u", "o.mp3", bitrate=256, title="T", artist="A")
+    assert "256k" in tagged
+    assert "title=T" in tagged and "artist=A" in tagged
+    local = _ffmpeg_args("mp3", "/tmp/src.m4a", "o.mp3")
+    assert "-user_agent" not in local
+    remote = _ffmpeg_args("mp3", "https://cdn.example/a.m4a", "o.mp3")
+    assert "-user_agent" in remote
+
+
+def test_clamp_and_fixed_key_include_bitrate():
+    assert clamp_mp3_bitrate(None) == 192
+    assert clamp_mp3_bitrate(64) == 64
+    assert clamp_mp3_bitrate(320) == 320
+    assert clamp_mp3_bitrate(10) == 64
+    assert clamp_mp3_bitrate(999) == 320
+    assert fixed_key("yt:abc", "mp3") == "fixed/yt_abc-mp3-192.mp3"
+    assert fixed_key("yt:abc", "mp3", 256) == "fixed/yt_abc-mp3-256.mp3"
+    assert fixed_key("yt:abc", "m4a") == "fixed/yt_abc-m4a.m4a"
 
 
 @pytest.mark.asyncio
@@ -74,7 +95,7 @@ async def test_ensure_fixed_creates_then_caches(tmp_path, monkeypatch):
     src = _src()
     out = await ensure_fixed_source(storage, "yt:abc123", src, "mp3")
     assert out is not None and out.mime_type == FIX_MIME["mp3"]
-    assert out.storage_key == fixed_key("yt:abc123", "mp3")
+    assert out.storage_key == fixed_key("yt:abc123", "mp3", 192)
     assert await storage.exists(out.storage_key)
     # second call: served from storage, ffmpeg not re-run
     out2 = await ensure_fixed_source(storage, "yt:abc123", src, "mp3")
@@ -86,7 +107,7 @@ async def test_ensure_fixed_creates_then_caches(tmp_path, monkeypatch):
 async def test_ensure_fixed_fail_soft_and_guards(tmp_path, monkeypatch):
     storage = FakeStorage(str(tmp_path))
 
-    async def boom(fmt, url, out_path):
+    async def boom(fmt, url, out_path, **kwargs):
         return "ffmpeg exploded"
     monkeypatch.setattr(audio_fix, "_ffmpeg", boom)
     assert await ensure_fixed_source(storage, "yt:x", _src(), "m4a") is None
@@ -110,6 +131,28 @@ async def test_fifo_eviction_removes_old_files(tmp_path, monkeypatch):
     assert len(audio_fix._recent) == 2
     oldest = fixed_key("yt:v0", "m4a")
     assert not os.path.exists(os.path.join(str(tmp_path), oldest))
+
+
+@pytest.mark.asyncio
+async def test_ensure_fixed_fetches_via_proxy(tmp_path, monkeypatch):
+    storage = FakeStorage(str(tmp_path))
+    calls = _patch_ok(monkeypatch)
+    fetched = []
+
+    class Proxy:
+        async def fetch_to_temp(self, url, workers=4, chunk_size=65536):
+            fetched.append((url, workers))
+            path = os.path.join(str(tmp_path), "src.bin")
+            with open(path, "wb") as fh:
+                fh.write(b"SRC")
+            return path
+
+    out = await ensure_fixed_source(
+        storage, "yt:abc", _src(), "mp3", stream_proxy=Proxy(), workers=6,
+    )
+    assert out is not None
+    assert fetched == [("https://x/y", 6)]
+    assert calls[0][1].endswith("src.bin")
 
 
 @pytest.mark.asyncio

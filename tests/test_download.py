@@ -212,31 +212,20 @@ async def test_download_dash_video_with_range(
 
 @pytest.mark.asyncio
 async def test_fetch_url_to_temp_writes_parallel_bytes():
-    """_fetch_url_to_temp downloads a URL through the
-    parallel Range proxy and writes the bytes to a temp
-    file that the caller owns."""
+    """_fetch_url_to_temp delegates to StreamProxy.fetch_to_temp."""
     import os
+    import tempfile
     from unittest.mock import AsyncMock, MagicMock
 
     import app.routes.download as dl
-    from app.services.stream_proxy import UpstreamHead
 
     payload = b"PARALLEL" * 512  # 4 KiB
+    fd, expected = tempfile.mkstemp()
+    os.write(fd, payload)
+    os.close(fd)
 
     proxy = MagicMock()
-    proxy.head = AsyncMock(return_value=UpstreamHead(
-        size_bytes=len(payload),
-        accept_ranges=True,
-        content_type="video/mp4",
-        supports_range=True,
-    ))
-
-    async def fake_parallel(url, start, end, chunk_size=65536, workers=4):
-        for i in range(0, len(payload), chunk_size):
-            yield payload[i:i + chunk_size]
-
-    proxy.stream_parallel = fake_parallel
-    proxy.stream = AsyncMock()
+    proxy.fetch_to_temp = AsyncMock(return_value=expected)
 
     path = await dl._fetch_url_to_temp(
         proxy, "https://cdn.up.test/v.mp4", 4
@@ -246,17 +235,18 @@ async def test_fetch_url_to_temp_writes_parallel_bytes():
             assert fh.read() == payload
     finally:
         os.unlink(path)
-    # a range-capable upstream must be fetched in parallel
-    proxy.stream.assert_not_awaited()
+    proxy.fetch_to_temp.assert_awaited_once()
+    assert proxy.fetch_to_temp.await_args.kwargs["workers"] == 4
 
 
 @pytest.mark.asyncio
 async def test_download_mp3_transcodes_and_streams(
     client, created_key, app_instance, monkeypatch
 ):
-    """format=mp3 transcodes the upstream audio to MP3 on
-    the fly (embedding ID3 title/artist tags) and streams
-    it; no bytes are written to disk."""
+    """format=mp3 transcodes to CBR MP3, caches the file, and
+    serves it Range-capable with Content-Length."""
+    import os
+    import tempfile
     from unittest.mock import AsyncMock
 
     import app.routes.download as dl
@@ -275,35 +265,21 @@ async def test_download_mp3_transcodes_and_streams(
     ))
 
     mp3_payload = b"ID3" + b"FAKEMP3DATA" * 64
-
-    class _Reader:
-        def __init__(self, chunks):
-            self._chunks = list(chunks)
-
-        async def read(self, n=-1):
-            return self._chunks.pop(0) if self._chunks else b""
-
-    class _Proc:
-        def __init__(self):
-            self.returncode = None
-            self.stdout = _Reader([mp3_payload])
-            self.stderr = _Reader([])
-
-        async def wait(self):
-            self.returncode = 0
-            return 0
-
-        def kill(self):
-            self.returncode = -9
-
-    proc = _Proc()
     captured = {}
 
-    async def fake_exec(*args, **kwargs):
-        captured["cmd"] = list(args)
-        return proc
+    async def fake_ensure(storage, media_id, src, fmt, **kwargs):
+        captured["kwargs"] = kwargs
+        key = f"fixed/{media_id.replace(':', '_')}-mp3-192.mp3"
+        fd, tmp = tempfile.mkstemp()
+        os.write(fd, mp3_payload)
+        os.close(fd)
+        await storage.put(key, tmp)
+        os.unlink(tmp)
+        return StreamSource(
+            storage_key=key, size_bytes=len(mp3_payload), mime_type="audio/mpeg",
+        )
 
-    monkeypatch.setattr(dl.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(dl, "ensure_fixed_source", fake_ensure)
 
     r = await client.get(
         "/download/yt:abc123",
@@ -315,26 +291,41 @@ async def test_download_mp3_transcodes_and_streams(
     )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/mpeg")
+    assert r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-length"] == str(len(mp3_payload))
+    assert r.headers["x-audio-bitrate"] == "192"
     assert "attachment" in r.headers["content-disposition"]
     assert ".mp3" in r.headers["content-disposition"]
     assert r.content == mp3_payload
-    # the ffmpeg command must use libmp3lame and embed the tags
-    cmd = captured["cmd"]
-    assert "libmp3lame" in cmd
-    assert any(a == "title=Song Title" for a in cmd)
-    assert any(a == "artist=Artist Name" for a in cmd)
+    assert captured["kwargs"]["bitrate"] == 192
+    assert captured["kwargs"]["title"] == "Song Title"
+    assert captured["kwargs"]["artist"] == "Artist Name"
+
+    ranged = await client.get(
+        "/download/yt:abc123",
+        params={
+            "key": created_key["api_key"],
+            "kind": "audio",
+            "format": "mp3",
+        },
+        headers={"Range": "bytes=0-15"},
+    )
+    assert ranged.status_code == 206
+    assert ranged.headers["content-range"] == f"bytes 0-15/{len(mp3_payload)}"
+    assert ranged.content == mp3_payload[:16]
 
 
 @pytest.mark.asyncio
 async def test_download_mp3_head_reports_content_type(
-    client, created_key, app_instance
+    client, created_key, app_instance, monkeypatch
 ):
-    """HEAD with format=mp3 reports audio/mpeg and the .mp3
-    filename without a content-length (the size is only
-    known after a full transcode)."""
+    """HEAD with format=mp3 reports audio/mpeg, Content-Length,
+    Accept-Ranges, and the .mp3 filename from the cached file."""
+    import os
+    import tempfile
     from unittest.mock import AsyncMock
 
-    import app.routes.download as dl  # noqa: F401  (ensures module import)
+    import app.routes.download as dl
     from app.services.media_provider import MediaMetadata, StreamSource
 
     provider = app_instance.state.provider
@@ -348,6 +339,20 @@ async def test_download_mp3_head_reports_content_type(
     provider.get_info = AsyncMock(return_value=MediaMetadata(
         media_id="abc123", title="Song Title", artist="Artist Name",
     ))
+    payload = b"ID3" + b"X" * 100
+
+    async def fake_ensure(storage, media_id, src, fmt, **kwargs):
+        key = f"fixed/{media_id.replace(':', '_')}-mp3-192.mp3"
+        fd, tmp = tempfile.mkstemp()
+        os.write(fd, payload)
+        os.close(fd)
+        await storage.put(key, tmp)
+        os.unlink(tmp)
+        return StreamSource(
+            storage_key=key, size_bytes=len(payload), mime_type="audio/mpeg",
+        )
+
+    monkeypatch.setattr(dl, "ensure_fixed_source", fake_ensure)
 
     r = await client.head(
         "/download/yt:abc123",
@@ -359,7 +364,11 @@ async def test_download_mp3_head_reports_content_type(
     )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/mpeg")
+    assert r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-length"] == str(len(payload))
+    assert r.headers["x-audio-bitrate"] == "192"
     assert ".mp3" in r.headers["content-disposition"]
+    assert r.content == b""
 
 
 def test_content_disposition_non_ascii_is_header_safe():
