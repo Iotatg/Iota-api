@@ -380,13 +380,18 @@ The full file is NEVER loaded into RAM. The `StreamingResponse` reads `STREAM_CH
 - **Admin token**: never logged, never returned. Constant-time comparison.
 - **Structured logging**: every record is single-line JSON. A redaction pass scrubs `api_key`, `authorization`, `cookie`, `password`, `secret`, `token`, signed URL patterns, and `iota_<hex>` patterns from every log message and every field value.
 - **Error responses**: structured `{"error", "detail", "request_id"}` — no stack traces, no internal paths, no secrets.
-- **Security headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy` (no geolocation / camera / mic).
-- **CORS**: configurable, defaults to `*`. Lock down in production.
+- **Security headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy` (no geolocation / camera / mic / payment), `Content-Security-Policy`, `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy`. HSTS is added when `ENABLE_HSTS=true` (only behind TLS).
+- **CORS**: configurable, defaults to `*`. Lock down in production. The CORS middleware is the outermost layer, so 413/429 replies still carry the headers a browser needs to read the status.
+- **Host header allow-list**: `ALLOWED_HOSTS` (comma separated) stops Host-header injection. `*` accepts any Host, which is what a load balancer needs.
+- **Per-IP abuse guard**: anonymous callers get `IP_RATE_LIMIT_PER_MINUTE` (600/min) requests, keyed callers get `IP_RATE_LIMIT_KEYED_PER_MINUTE` (6000/min), and `/admin` gets a tight `ADMIN_RATE_LIMIT_PER_MINUTE` (20/min). The counter lives in Redis when configured, so the budget is global across replicas.
+- **Docs hidden in production**: set `ENABLE_DOCS=false` to remove `/swagger`, `/redoc` and `/openapi.json`.
+- **`/metrics` protected**: it requires the admin token unless `METRICS_REQUIRE_ADMIN_TOKEN=false`.
 - **Path traversal**: storage keys are resolved under a fixed base directory; out-of-base paths are rejected.
 - **SSRF protection**: the demo provider only reads from a local directory. Real providers MUST NOT accept user-supplied URLs.
 - **No shell execution**: we never call `os.system`, `subprocess`, or `shell=True`. The codebase has no shell-out paths.
 - **Max request size**: enforced by `MAX_REQUEST_SIZE` (1 MiB default) and by Nginx's `client_max_body_size`.
 - **Rate limit fail-closed**: if Redis is unreachable, the rate limiter rejects the request (returns 503) rather than allowing unlimited abuse.
+- **Upstream pressure is bounded**: concurrent yt-dlp extractions are capped per worker (`YTDLP_MAX_CONCURRENCY`) and duplicate requests for the same track share one extraction (single flight), so a request burst cannot spawn thousands of subprocesses.
 
 ---
 
@@ -405,9 +410,42 @@ For production, at minimum:
 9. **Set up Prometheus scraping** of `/metrics`. The included metric names follow Prometheus conventions.
 10. **Add Alembic migrations** before relying on `init_db()` in production. The current code uses `init_db()` for simplicity; in a multi-instance production setup you want migrations so schema changes are atomic.
 
+### Health probes
+
+| Endpoint | Purpose | Touches dependencies |
+|---|---|---|
+| `GET /health/live` | Liveness (container / Kubernetes) | No — always instant |
+| `GET /health/ready` | Readiness (load balancer) | Yes, cached for `HEALTH_CHECK_CACHE_TTL` (5 s) |
+| `GET /health` | Deep check for humans | Yes, cached for 5 s |
+
+The cache matters: a probe that queries Postgres on every call drains the
+connection pool under a probe storm. Measured on a 2 vCPU box, the
+uncached `/health` ran at 308 req/s while the cached version reached
+762 req/s and `/health/live` 1,800 req/s.
+
 ### Scaling
 
 The app is stateless (all state is in Postgres + Redis + storage). Scale horizontally by adding more Uvicorn workers / more containers. No sticky sessions needed.
+
+Measured cost of a request is **~0.55 ms of server CPU**, and throughput
+scales linearly with worker count (one worker saturates one core):
+
+```
+workers per replica ≈ (target_rps × 0.00055 s) × safety_factor
+```
+
+Measure your own deployment with the bundled raw-socket load tester
+(it avoids the client overhead that distorts httpx-based benchmarks):
+
+```bash
+python3 scripts/loadtest.py --path /health/live --requests 3000 --connections 50
+```
+
+Keep `DB_POOL_SIZE × workers` below the database's `max_connections`.
+
+> With Redis disabled the in-memory rate limiter is per process, so the
+> effective quota becomes `workers × limit`. Enable Redis for a global
+> limit.
 
 ### Railway (free plan) deployment notes
 

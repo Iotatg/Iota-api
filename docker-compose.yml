@@ -47,6 +47,17 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      APP_ENV: ${APP_ENV:-production}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      ENABLE_DOCS: ${ENABLE_DOCS:-false}
+      ENABLE_HSTS: ${ENABLE_HSTS:-true}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
+      IP_RATE_LIMIT_PER_MINUTE: ${IP_RATE_LIMIT_PER_MINUTE:-600}
+      IP_RATE_LIMIT_KEYED_PER_MINUTE: ${IP_RATE_LIMIT_KEYED_PER_MINUTE:-6000}
+      ADMIN_RATE_LIMIT_PER_MINUTE: ${ADMIN_RATE_LIMIT_PER_MINUTE:-20}
+      YTDLP_MAX_CONCURRENCY: ${YTDLP_MAX_CONCURRENCY:-4}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,8 +65,12 @@ services:
         condition: service_healthy
     volumes:
       - api_storage:/app/storage
+    # Bound to loopback: nginx is the only public entry point. The app
+    # must not be reachable directly, otherwise the proxy headers it
+    # trusts could be spoofed.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    stop_grace_period: 150s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

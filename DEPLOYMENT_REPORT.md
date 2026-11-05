@@ -178,12 +178,88 @@ Credentials are stored only as env vars on the Railway service. They are
 5. **Logs are at `info` level.** No log shipping. Set `LOG_LEVEL=debug` for
    more detail.
 
-6. **No HTTPS cert pinning, no HSTS.** This is a Railway-provided HTTPS
-   proxy. For multi-tenant production, add HSTS via Nginx.
+6. **HSTS is off by default.** The app only sends
+   `Strict-Transport-Security` when `ENABLE_HSTS=true`, because a
+   browser that receives HSTS over plain HTTP refuses HTTP for a year.
+   Set it only behind TLS. The bundled nginx already sends it.
 
-7. **No request size limit middleware.** `MAX_REQUEST_SIZE` is configured
-   but only used by the `search` route's query param. Add a middleware if
-   you want to limit body size globally.
+7. ~~**No request size limit middleware.**~~ Fixed: a pure-ASGI
+   `BodySizeLimitMiddleware` now rejects any body over
+   `MAX_REQUEST_SIZE` with 413 before it reaches a handler.
+
+---
+
+## Production hardening (added)
+
+### What is enforced in the app
+
+| Control | Where | Setting |
+|---|---|---|
+| Per-IP request budget (anonymous) | `app/middleware/security.py` | `IP_RATE_LIMIT_PER_MINUTE` (default 600/min) |
+| Per-IP budget for keyed callers | same | `IP_RATE_LIMIT_KEYED_PER_MINUTE` (default 6000/min) |
+| Tight `/admin` budget | same | `ADMIN_RATE_LIMIT_PER_MINUTE` (default 20/min) |
+| Request body cap (413) | same | `MAX_REQUEST_SIZE` |
+| Host header allow-list | Starlette `TrustedHostMiddleware` | `ALLOWED_HOSTS` |
+| HSTS / CSP / Permissions-Policy / COOP / CORP | `RequestContextMiddleware` | `ENABLE_HSTS` |
+| Docs hidden in production | `app/main.py` | `ENABLE_DOCS` |
+| `/metrics` behind the admin token | `app/routes/health.py` | `METRICS_REQUIRE_ADMIN_TOKEN` |
+| Concurrent yt-dlp extractions capped | `app/services/youtube_provider.py` | `YTDLP_MAX_CONCURRENCY` |
+| Duplicate extractions coalesced | same (single flight) | always on |
+
+The IP limiter uses Redis when it is configured, so the budget is global
+across replicas; without Redis it falls back to a per-process counter.
+
+### Scale knobs
+
+| Setting | Meaning |
+|---|---|
+| `WEB_CONCURRENCY` | uvicorn worker processes (one event loop each) |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | asyncpg pool per worker |
+| `YTDLP_MAX_CONCURRENCY` | simultaneous yt-dlp subprocesses per worker |
+| `STREAM_PARALLEL_WORKERS` | concurrent Range connections per media fetch |
+
+**Measured on a 2 vCPU box** (`scripts/loadtest.py`, raw sockets so the
+client does not distort the result):
+
+- **0.55 ms server CPU per request** on the liveness probe.
+- **~1,800 req/s with one worker**, one core saturated.
+- **~2,000 req/s with two workers**, scaling linearly per core.
+
+Throughput therefore scales with worker count up to the CPU allocation,
+and each worker holds roughly `1 / 0.00055` requests per second of
+capacity. Size the replica count from the target request rate:
+
+```
+workers per replica ≈ (target_rps × 0.00055 s) × safety_factor
+```
+
+### Health probes
+
+- `GET /health/live` — liveness. Touches no dependency, answers in
+  microseconds. Use it for container and Kubernetes liveness probes.
+- `GET /health/ready` — readiness. 503 when Postgres or Redis is
+  unreachable. Use it to take a replica out of rotation.
+- `GET /health` — deep check, served from a short-lived cache
+  (`HEALTH_CHECK_CACHE_TTL`, default 5 s) so a probe storm cannot
+  drain the connection pool.
+
+### Edge rate limiting
+
+`nginx.conf` adds `limit_req` zones (general, admin) and `limit_conn`,
+and restricts `/admin` and `/metrics` to the internal network. The app
+container is published on `127.0.0.1` only, so the proxy headers it
+trusts cannot be spoofed from outside.
+
+### Reproducing the numbers
+
+```bash
+# Start the service the way production does
+WEB_CONCURRENCY=2 python3 -m uvicorn app.main:app \
+  --loop uvloop --http httptools --workers 2 --proxy-headers
+
+# Measure it
+python3 scripts/loadtest.py --path /health/live --requests 3000 --connections 50
+```
 
 ---
 
@@ -197,6 +273,11 @@ Credentials are stored only as env vars on the Railway service. They are
   Secret References for production.
 - **No automated migrations** — schema is created via `init_db()` at
   startup. Use Alembic for production.
+- **The in-memory rate limiter is per process.** With more than one
+  worker, each worker enforces its own quota, so the effective limit is
+  `workers × limit`. Redis removes this gap.
+- **No CDN.** All media bytes flow through the API. At high volume put
+  the storage behind a CDN (`S3_CDN_BASE_URL`).
 
 ---
 

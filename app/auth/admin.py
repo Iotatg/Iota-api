@@ -15,6 +15,15 @@ async def require_admin(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ) -> None:
     """FastAPI dependency: 401 if X-Admin-Token is missing or wrong."""
+    check_admin_token(x_admin_token)
+
+
+def check_admin_token(x_admin_token: str | None) -> None:
+    """Validate an admin token outside of FastAPI's dependency system.
+
+    Raises 401 when the token is missing and 403 when it does not
+    match. The comparison is constant-time.
+    """
     settings = get_settings()
     if not x_admin_token:
         raise HTTPException(

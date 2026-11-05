@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     metadata_cache_ttl: int = 300
     metadata_cache_max_size: int = 10_000
     rate_limit_window_seconds: int = 60
+    # How long a dependency health check is reused before it is
+    # re-run. A probe that queries the database on every call drains
+    # the connection pool under load.
+    health_check_cache_ttl: float = 5.0
 
     # ── Streaming ─────────────────────────────────────────────────────────
     stream_chunk_size: int = 65536
@@ -171,6 +175,47 @@ class Settings(BaseSettings):
     # ── Security ──────────────────────────────────────────────────────────
     cors_allow_origins: str = "*"
     max_request_size: int = 1_048_576
+    # Comma-separated Host header values the app answers to. "*" (the
+    # default) accepts any Host, which is what a container behind a
+    # load balancer usually needs; set it to the real domains in
+    # production so a forged Host cannot poison absolute URLs.
+    allowed_hosts: str = "*"
+    # Serve /swagger, /redoc and /openapi.json. Turn off for a public
+    # production deployment so the API surface is not published.
+    enable_docs: bool = True
+    # Send Strict-Transport-Security. Only enable it behind TLS,
+    # otherwise a browser will refuse plain HTTP for a whole year.
+    enable_hsts: bool = False
+    hsts_max_age: int = 31536000
+    # Per-IP request budget for anonymous callers (per minute). Guards
+    # the public surface against scraping and key guessing. 0 disables.
+    ip_rate_limit_per_minute: int = 600
+    # Budget for callers that present an API key; they are additionally
+    # governed by the key's own per-minute / daily quotas. 0 disables.
+    ip_rate_limit_keyed_per_minute: int = 6000
+    # Budget for /admin routes, where a valid token is the prize.
+    admin_rate_limit_per_minute: int = 20
+    # Trust X-Real-IP / X-Forwarded-For for the client address. Enable
+    # only when a trusted proxy (our nginx) sets them.
+    trust_proxy_headers: bool = True
+    # Require the admin token on /metrics. Metrics reveal request rates
+    # and endpoint usage, which is reconnaissance. Turn this off only
+    # when the scraper reaches the app over a private network.
+    metrics_require_admin_token: bool = True
+
+    # ── Production scaling ───────────────────────────────────────────────
+    # Uvicorn worker processes. Each worker owns its own event loop and
+    # memory cache, so the count should match the CPU allocation.
+    server_workers: int = 1
+    # Maximum number of concurrent yt-dlp extractions per worker. Each
+    # extraction is a CPU-heavy subprocess, so this caps the damage a
+    # request burst can do to the box.
+    ytdlp_max_concurrency: int = 4
+    # Asyncpg connection pool. Total connections across all workers
+    # should stay below the database's max_connections.
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout: int = 30
 
     # ── Derived helpers ───────────────────────────────────────────────────
     @property
@@ -192,6 +237,13 @@ class Settings(BaseSettings):
         if self.cors_allow_origins.strip() == "*":
             return ["*"]
         return [o.strip() for o in self.cors_allow_origins.split(",") if o.strip()]
+
+    @property
+    def allowed_hosts_list(self) -> List[str]:
+        raw = self.allowed_hosts.strip()
+        if not raw or raw == "*":
+            return ["*"]
+        return [h.strip() for h in raw.split(",") if h.strip()]
 
     @property
     def is_production(self) -> bool:

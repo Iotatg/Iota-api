@@ -12,6 +12,7 @@ invoked and no network is touched. The tests cover:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -742,3 +743,100 @@ class TestPickVideoSplitSelection:
         assert split is None or split.is_hls is True
 
 
+class TestCoalescingAndConcurrency:
+    """A burst of requests for the same track must not turn into a
+    burst of yt-dlp subprocesses."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_share_one_extraction(self):
+        from app.services import youtube_provider as yp
+
+        calls = {"n": 0}
+
+        async def slow_result(*args, **kwargs):
+            calls["n"] += 1
+            await asyncio.sleep(0.05)
+            return _ok_json({
+                "id": "dQw4w9WgXcQ",
+                "title": "Song",
+                "url": "https://cdn.test/a.m4a",
+            })
+
+        with patch.object(yp, "_run_ytdlp", slow_result):
+            provider = yp.YouTubeProvider(api_key=None, cookies_file=None)
+            results = await asyncio.gather(*[
+                provider._ytdlp_info_and_url(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "audio"
+                )
+                for _ in range(8)
+            ])
+
+        assert calls["n"] == 1
+        assert all(r is not None for r in results)
+        assert all(r[1] == "https://cdn.test/a.m4a" for r in results)
+
+    @pytest.mark.asyncio
+    async def test_different_targets_are_not_merged(self):
+        from app.services import youtube_provider as yp
+
+        calls = {"n": 0}
+
+        async def counting(*args, **kwargs):
+            calls["n"] += 1
+            return _ok_json({"url": "https://cdn.test/a.m4a"})
+
+        with patch.object(yp, "_run_ytdlp", counting):
+            provider = yp.YouTubeProvider(api_key=None, cookies_file=None)
+            await asyncio.gather(
+                provider._ytdlp_info_and_url("target-a", "audio"),
+                provider._ytdlp_info_and_url("target-b", "audio"),
+            )
+        assert calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_failure_is_shared_and_not_leaked(self):
+        from app.services import youtube_provider as yp
+
+        calls = {"n": 0}
+
+        async def failing(*args, **kwargs):
+            calls["n"] += 1
+            await asyncio.sleep(0.02)
+            return _fail("nope")
+
+        with patch.object(yp, "_run_ytdlp", failing):
+            provider = yp.YouTubeProvider(api_key=None, cookies_file=None)
+            results = await asyncio.gather(*[
+                provider._ytdlp_info_and_url("target-x", "audio")
+                for _ in range(5)
+            ])
+        assert calls["n"] == 1
+        assert all(r is None for r in results)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_extractions_are_capped(self):
+        """The yt-dlp gate must keep the number of simultaneous
+        subprocesses at the configured limit."""
+        from app.services import youtube_provider as yp
+
+        settings = yp.get_settings()
+        limit = max(1, settings.ytdlp_max_concurrency)
+        live = {"n": 0}
+        peak = {"n": 0}
+
+        async def tracking(argv, timeout):
+            live["n"] += 1
+            peak["n"] = max(peak["n"], live["n"])
+            await asyncio.sleep(0.02)
+            live["n"] -= 1
+            return _ok_json({"url": "https://cdn.test/a.m4a"})
+
+        # Patch the inner call so the semaphore in _run_ytdlp is
+        # actually exercised.
+        with patch.object(yp, "_ytdlp_once", tracking):
+            provider = yp.YouTubeProvider(api_key=None, cookies_file=None)
+            await asyncio.gather(*[
+                provider._ytdlp_info_and_url(f"target-{i}", "audio")
+                for i in range(limit * 3)
+            ])
+        assert peak["n"] <= limit

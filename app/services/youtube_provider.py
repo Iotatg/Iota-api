@@ -208,6 +208,34 @@ async def _ytdlp_once(argv: List[str], timeout: float) -> _YtdlpResult:
     return _YtdlpResult(ok=True, data=stdout)
 
 
+# ── Concurrency control ─────────────────────────────────────────────────
+# Every yt-dlp call is a CPU-heavy subprocess. A burst of requests would
+# otherwise spawn one process per request and starve the box, so the
+# number of concurrent extractions per worker is capped. Requests queue
+# on the semaphore instead of failing, which keeps latency honest.
+_ytdlp_semaphore: Optional[asyncio.Semaphore] = None
+_ytdlp_semaphore_limit = 0
+
+
+def _ytdlp_gate() -> asyncio.Semaphore:
+    global _ytdlp_semaphore, _ytdlp_semaphore_limit
+    limit = max(1, int(get_settings().ytdlp_max_concurrency or 1))
+    if _ytdlp_semaphore is None or _ytdlp_semaphore_limit != limit:
+        # Rebuilt only when the configured limit changes, so the hot path
+        # never allocates a new semaphore.
+        _ytdlp_semaphore = asyncio.Semaphore(limit)
+        _ytdlp_semaphore_limit = limit
+    return _ytdlp_semaphore
+
+
+# Single-flight registry: when many users ask for the same track at the
+# same moment, only one extraction runs and the rest wait for its
+# result. Without this a popular song can spawn hundreds of identical
+# yt-dlp processes.
+_flight_lock_guard = asyncio.Lock()
+
+
+
 async def _run_ytdlp(
     *args: str, timeout: float = _YTDLP_TIMEOUT, bypass_breaker: bool = False
 ) -> _YtdlpResult:
@@ -217,7 +245,11 @@ async def _run_ytdlp(
     ``bypass_breaker`` runs the command even while the breaker is open
     (used for search feeds, which address a different endpoint and can
     survive an IP-level player block); its result never mutates breaker
-    state so a doomed bypass cannot prolong the cooldown."""
+    state so a doomed bypass cannot prolong the cooldown.
+
+    Concurrent extractions are capped by a semaphore: a request burst
+    queues here instead of spawning an unbounded number of CPU-heavy
+    subprocesses."""
     argv_prefix = _resolve_ytdlp_argv()
     if not argv_prefix:
         return _YtdlpResult(ok=False, stderr="yt-dlp not found on PATH")
@@ -227,24 +259,66 @@ async def _run_ytdlp(
             stderr="youtube circuit breaker open (IP bot-blocked; cooling down)",
         )
     argv = [*argv_prefix, *args]
-    result = await _ytdlp_once(argv, timeout)
-    if (
-        not result.ok
-        and "--extractor-args" not in args
-        and any(m in result.stderr for m in _YTDLP_RETRY_MARKERS)
-    ):
-        logger.info("ytdlp_android_retry", extra={"reason": result.stderr.strip().splitlines()[-1:]})
-        retry_argv = [*argv_prefix, *_strip_cookies(list(args)), *_ANDROID_EXTRA_ARGS]
-        result2 = await _ytdlp_once(retry_argv, timeout)
-        if result2.ok:
+    gate = _ytdlp_gate()
+    async with gate:
+        result = await _ytdlp_once(argv, timeout)
+        if (
+            not result.ok
+            and "--extractor-args" not in args
+            and any(m in result.stderr for m in _YTDLP_RETRY_MARKERS)
+        ):
+            logger.info("ytdlp_android_retry", extra={"reason": result.stderr.strip().splitlines()[-1:]})
+            retry_argv = [*argv_prefix, *_strip_cookies(list(args)), *_ANDROID_EXTRA_ARGS]
+            result2 = await _ytdlp_once(retry_argv, timeout)
+            if result2.ok:
+                result = result2
+                if not bypass_breaker:
+                    _breaker_observe(result2)
+                    return result2
             result = result2
-            if not bypass_breaker:
-                _breaker_observe(result2)
-                return result2
-        result = result2
     if not bypass_breaker:
         _breaker_observe(result)
     return result
+
+
+# ── Single-flight coalescing ────────────────────────────────────────────
+# When many users request the same track at the same moment, one
+# extraction is enough: the first caller runs it and every other caller
+# waits for the very same result. This is the difference between one
+# yt-dlp process and thousands for a popular song.
+_inflight: dict[str, asyncio.Future] = {}
+
+
+async def _coalesce(key: str, factory):
+    """Run ``factory`` once per key; concurrent callers share the result."""
+    loop = asyncio.get_running_loop()
+    async with _flight_lock_guard:
+        future = _inflight.get(key)
+        owner = future is None
+        if owner:
+            future = loop.create_future()
+            _inflight[key] = future
+            # Retrieve the exception on the future so a failure with no
+            # waiter does not log "exception was never retrieved".
+            future.add_done_callback(
+                lambda f: f.exception() if f.done() and not f.cancelled() else None
+            )
+    if not owner:
+        return await asyncio.shield(future)
+    try:
+        result = await factory()
+    except BaseException as exc:
+        if not future.done():
+            future.set_exception(exc)
+        raise
+    else:
+        if not future.done():
+            future.set_result(result)
+        return result
+    finally:
+        async with _flight_lock_guard:
+            if _inflight.get(key) is future:
+                _inflight.pop(key, None)
 
 
 def _log_ytdlp_fail(op: str, target: str, stderr: str) -> None:
@@ -812,7 +886,18 @@ class YouTubeProvider(MediaProvider):
         ``url`` field honours ``-f`` (so it is the selected audio or
         video stream), and the same payload carries title/artist/
         duration for the metadata cache.
+
+        Concurrent callers asking for the same target share one
+        extraction (single flight).
         """
+        return await _coalesce(
+            f"info:{media_type}:{target}",
+            lambda: self._ytdlp_info_and_url_once(target, media_type),
+        )
+
+    async def _ytdlp_info_and_url_once(
+        self, target: str, media_type: str
+    ) -> Optional[Tuple[dict, str]]:
         if not self._ytdlp_argv:
             return None
         if media_type == "video":
@@ -860,7 +945,18 @@ class YouTubeProvider(MediaProvider):
         variant playlist (remuxed with ffmpeg). Only directly
         fetchable media is returned for the non-HLS modes — a
         manifest URL is never handed out as if it were a file.
+
+        Concurrent callers asking for the same target and height
+        share one extraction (single flight).
         """
+        return await _coalesce(
+            f"split:{max_height}:{target}",
+            lambda: self._ytdlp_video_split_once(target, max_height),
+        )
+
+    async def _ytdlp_video_split_once(
+        self, target: str, max_height: Optional[int] = None
+    ) -> Optional[_VideoSplit]:
         if not self._ytdlp_argv:
             return None
         args = [
@@ -897,7 +993,19 @@ class YouTubeProvider(MediaProvider):
     ) -> List[dict]:
         """One flat ``--dump-json`` invocation; works for ``ytsearchN:``
         targets, playlist URLs and the trending feed alike. Entries carry
-        id/title/channel/duration/thumbnail/view_count."""
+        id/title/channel/duration/thumbnail/view_count.
+
+        Concurrent callers asking for the same feed share one
+        extraction (single flight).
+        """
+        return await _coalesce(
+            f"flat:{playlist_end}:{target}",
+            lambda: self._ytdlp_flat_entries_once(target, playlist_end),
+        )
+
+    async def _ytdlp_flat_entries_once(
+        self, target: str, playlist_end: int = 0
+    ) -> List[dict]:
         if not self._ytdlp_argv:
             return []
         args = [

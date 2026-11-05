@@ -40,8 +40,9 @@ if _url.startswith("sqlite"):
     _engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
     _engine_kwargs.update(
-        pool_size=10,
-        max_overflow=20,
+        pool_size=max(1, _settings.db_pool_size),
+        max_overflow=max(0, _settings.db_max_overflow),
+        pool_timeout=max(1, _settings.db_pool_timeout),
         pool_pre_ping=True,
         pool_recycle=1800,
     )

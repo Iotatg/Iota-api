@@ -12,22 +12,26 @@ from __future__ import annotations
 
 import os
 import tempfile
-import time
-import uuid
 from contextlib import asynccontextmanager
-from typing import Awaitable, Callable, Optional
+from typing import Callable, Optional
 
 import redis.asyncio as redis
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.cache.hierarchy import CacheHierarchy
 from app.cache.memory_cache import MemoryCache
 from app.cache.redis_cache import RedisCache
 from app.config import get_settings
 from app.database import close_db, init_db
+from app.middleware.security import (
+    BodySizeLimitMiddleware,
+    IPRateLimitMiddleware,
+    RequestContextMiddleware,
+)
 from pathlib import Path
 
 from app.catalog.index import SongIndex
@@ -49,7 +53,6 @@ from app.services.stream_cache import StreamCacheService
 from app.services.stream_proxy import StreamProxy
 from app.services.youtube_provider import YouTubeProvider
 from app.utils.logging import configure_logging, get_logger
-from app.utils.metrics import api_requests_total
 from app.utils.rate_limit import RateLimiter
 
 logger = get_logger(__name__)
@@ -267,12 +270,49 @@ def create_app() -> FastAPI:
             "The root (/download, /stream, ...) and /api/v1/... paths keep working too."
         ),
         lifespan=lifespan,
-        docs_url="/swagger",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url="/swagger" if settings.enable_docs else None,
+        redoc_url="/redoc" if settings.enable_docs else None,
+        openapi_url="/openapi.json" if settings.enable_docs else None,
     )
 
+    # ── /v1 path alias (OpenAI-style single base) ───────────────
+    # Every endpoint is reachable under /v1 in addition to its
+    # canonical root or /api/v1 path.
+    app.add_middleware(V1AliasMiddleware)
+
+    # ── Middleware: request id, timing, log, security headers ───────────
+    # Pure ASGI (not BaseHTTPMiddleware): the latter adds a streaming
+    # wrapper per response, which is measurable overhead at high volume.
+    app.add_middleware(
+        RequestContextMiddleware,
+        enable_hsts=settings.enable_hsts,
+        hsts_max_age=settings.hsts_max_age,
+        expose_powered_by=not settings.is_production,
+        content_security_policy=(
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        ),
+    )
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_bytes=settings.max_request_size,
+    )
+    app.add_middleware(
+        IPRateLimitMiddleware,
+        per_minute=settings.ip_rate_limit_per_minute,
+        keyed_per_minute=settings.ip_rate_limit_keyed_per_minute,
+        admin_per_minute=settings.admin_rate_limit_per_minute,
+        trust_proxy=settings.trust_proxy_headers,
+    )
+    if settings.allowed_hosts_list != ["*"]:
+        app.add_middleware(
+            TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts_list
+        )
+
     # ── CORS ──────────────────────────────────────────────────────────────
+    # Added last so it is the OUTERMOST middleware: a browser must see
+    # the CORS headers on every response, including the 413/429 replies
+    # produced by the middlewares above, otherwise the client sees an
+    # opaque CORS failure instead of the real status code.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
@@ -285,68 +325,11 @@ def create_app() -> FastAPI:
             "Content-Length",
             "X-RateLimit-Remaining-Minute",
             "X-RateLimit-Remaining-Day",
+            "X-Audio-Bitrate",
             "Retry-After",
         ],
         max_age=600,
     )
-
-    # ── /v1 path alias (OpenAI-style single base) ───────────────
-    # Every endpoint is reachable under /v1 in addition to its
-    # canonical root or /api/v1 path.
-    app.add_middleware(V1AliasMiddleware)
-
-    # ── Middleware: request id, timing, log ───────────────────────────────
-    @app.middleware("http")
-    async def request_middleware(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        rid = request.headers.get("X-Request-Id") or uuid.uuid4().hex
-        request.state.request_id = rid
-        start = time.perf_counter()
-        try:
-            response = await call_next(request)
-        except Exception as e:
-            logger.exception("unhandled_error", extra={"request_id": rid, "err": str(e)})
-            response = JSONResponse(
-                status_code=500,
-                content={"error": "internal_error", "detail": "An internal error occurred.",
-                         "request_id": rid},
-            )
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        song_count = 0
-        try:
-            song_count = len(getattr(request.app.state, "song_index", []) or [])
-        except Exception:
-            song_count = 0
-        response.headers["X-Request-Id"] = rid
-        response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.2f}"
-        response.headers["X-Response-Time-MS"] = f"{elapsed_ms:.2f}ms"
-        response.headers["X-Powered-By"] = "Iota-Music-Engine"
-        response.headers["X-API-Version"] = "2.0.0"
-        response.headers["X-Total-Songs"] = str(song_count)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-
-        # Metrics
-        try:
-            endpoint = request.scope.get("route").path if request.scope.get("route") else request.url.path  # type: ignore
-        except Exception:
-            endpoint = request.url.path
-        api_requests_total.labels(
-            endpoint=endpoint,
-            method=request.method,
-            status=str(response.status_code),
-        ).inc()
-
-        logger.info("request", extra={
-            "request_id": rid,
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "duration_ms": elapsed_ms,
-        })
-        return response
 
     # ── Global exception handler: normalize HTTP errors ───────────────────
     @app.exception_handler(StarletteHTTPException)
