@@ -144,6 +144,70 @@ class TestGetInfo:
                     p.get_info("dQw4w9WgXcQ")
                 )
 
+    def test_transient_failure_stays_retryable(self):
+        """A blocked or timed-out extraction is not a missing video.
+
+        The client must be able to retry, so the failure is reported as
+        unavailable (503) and not as "not found" (404).
+        """
+        p = YouTubeProvider(api_key=None)
+
+        async def failed_dump(target):
+            p._last_dump_failure = "transient: yt-dlp timeout"
+            return None
+
+        with patch.object(
+            p, "_data_api_video", AsyncMock(return_value=None)
+        ), patch.object(p, "_ytdlp_dump_json", failed_dump):
+            import asyncio
+            with pytest.raises(ProviderUnavailableError):
+                asyncio.get_event_loop().run_until_complete(
+                    p.get_info("dQw4w9WgXcQ")
+                )
+
+
+class TestDumpFallback:
+    """The metadata extraction must survive a walled player client."""
+
+    def test_blocked_extraction_retries_with_another_client(self, monkeypatch):
+        p = YouTubeProvider(api_key=None)
+        calls = []
+
+        async def fake_once(argv, timeout):
+            calls.append(argv)
+            if "youtube:player_client=web_embedded" in argv:
+                return _ok_json({"id": "x", "title": "T"})
+            return _YtdlpResult(ok=False, stderr="yt-dlp timeout")
+
+        monkeypatch.setattr("app.services.youtube_provider._ytdlp_once", fake_once)
+        monkeypatch.setattr(
+            "app.services.youtube_provider._resolve_ytdlp_argv", lambda: ["yt-dlp"]
+        )
+        info = asyncio.get_event_loop().run_until_complete(
+            p._ytdlp_dump_json("https://www.youtube.com/watch?v=x")
+        )
+        assert info is not None and info["title"] == "T"
+        assert len(calls) == 2
+
+    def test_missing_video_is_not_retried(self, monkeypatch):
+        p = YouTubeProvider(api_key=None)
+        calls = []
+
+        async def fake_once(argv, timeout):
+            calls.append(argv)
+            return _YtdlpResult(ok=False, stderr="ERROR: [youtube] x: Private video")
+
+        monkeypatch.setattr("app.services.youtube_provider._ytdlp_once", fake_once)
+        monkeypatch.setattr(
+            "app.services.youtube_provider._resolve_ytdlp_argv", lambda: ["yt-dlp"]
+        )
+        info = asyncio.get_event_loop().run_until_complete(
+            p._ytdlp_dump_json("https://www.youtube.com/watch?v=x")
+        )
+        assert info is None
+        assert len(calls) == 1
+        assert p._last_dump_failure == "not_found"
+
 
 class TestGetStream:
     def test_returns_direct_url(self):

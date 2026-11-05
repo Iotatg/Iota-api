@@ -122,6 +122,14 @@ class Settings(BaseSettings):
     video_merge_cache_dir: str = ".data/merge-cache"
     # Budget for the merged-video cache directory in megabytes.
     video_merge_cache_max_mb: int = 1024
+    # How long a resolved DASH/HLS split (the CDN urls of the video and
+    # the audio stream) is reused. The urls of a signed session stay
+    # valid for hours, and resolving them costs seconds of yt-dlp work.
+    video_split_cache_ttl: int = 7200
+    # Largest video a download may produce (bytes). A 4K stream of a
+    # long video is several gigabytes, merging it wastes minutes and
+    # disk for a file no chat can take.
+    video_max_bytes: int = 1_500_000_000
     # Default ceiling on requested video heights. Voice-chat previews
     # want 720p: 1080p+ fetches are far too large and slow for them.
     video_max_height_cap: int = 720
@@ -168,6 +176,12 @@ class Settings(BaseSettings):
     # flagged IP (which prolongs the block). 0 disables the breaker.
     youtube_breaker_threshold: int = 3
     youtube_breaker_cooldown_seconds: int = 1800
+    # Timeout of a single yt-dlp extraction (seconds). The extraction
+    # mints a PO token through the EJS component, which needs a node
+    # round trip; under load a cold extraction needs more than 25 s and
+    # must not be cut off, a cut-off extraction would look like a
+    # missing video to the client.
+    youtube_ytdlp_timeout: float = 45.0
     # Upstream proxy timeout (seconds) for the StreamProxy.
     stream_proxy_connect_timeout: float = 10.0
     stream_proxy_read_timeout: float = 60.0

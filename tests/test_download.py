@@ -211,6 +211,141 @@ async def test_download_dash_video_with_range(
 
 
 @pytest.mark.asyncio
+async def test_download_dash_head_reports_no_size(
+    client, created_key, app_instance, monkeypatch, tmp_path
+):
+    """A DASH HEAD must not remux and must not guess a length.
+
+    The length of the merged file is unknown until the merge ran. A
+    wrong Content-Length makes a range client address bytes that do
+    not exist, so the HEAD reports neither a size nor range support.
+    """
+    from unittest.mock import AsyncMock
+
+    import app.routes.download as dl
+    from app.services.media_provider import StreamSource
+
+    _isolate_merge_cache(monkeypatch, tmp_path)
+    provider = app_instance.state.provider
+    provider.get_stream_by_type = AsyncMock(return_value=StreamSource(
+        storage_key="",
+        size_bytes=0,
+        mime_type="video/mp4",
+        direct_url="https://cdn.up.test/video-only.mp4",
+        direct_url_audio="https://cdn.up.test/audio-only.m4a",
+        is_dash=True,
+    ))
+
+    called = []
+
+    async def fake_merge(stream_proxy, video_url, audio_url, workers):
+        called.append(video_url)
+        raise AssertionError("HEAD must not remux")
+
+    monkeypatch.setattr(dl, "_merge_dash_to_temp", fake_merge)
+
+    r = await client.head(
+        "/download/yt:abc123",
+        params={"key": created_key["api_key"], "kind": "video"},
+    )
+    assert r.status_code == 200
+    assert "content-length" not in r.headers
+    assert r.headers["accept-ranges"] == "none"
+    assert not called
+
+
+@pytest.mark.asyncio
+async def test_parallel_dash_requests_share_one_merge(
+    client, created_key, app_instance, monkeypatch, tmp_path
+):
+    """A client that downloads in parallel must not start one merge per
+    chunk: the requests share a single merge and then read the cached
+    file."""
+    import asyncio
+    import os
+    import tempfile
+    from unittest.mock import AsyncMock
+
+    import app.routes.download as dl
+    from app.services.media_provider import StreamSource
+
+    _isolate_merge_cache(monkeypatch, tmp_path)
+    provider = app_instance.state.provider
+    provider.get_stream_by_type = AsyncMock(return_value=StreamSource(
+        storage_key="",
+        size_bytes=0,
+        mime_type="video/mp4",
+        direct_url="https://cdn.up.test/video-only.mp4",
+        direct_url_audio="https://cdn.up.test/audio-only.m4a",
+        is_dash=True,
+    ))
+
+    payload = b"FAKEVIDEO" * 512  # 4 KiB
+    merges = []
+
+    async def fake_merge(stream_proxy, video_url, audio_url, workers):
+        merges.append(video_url)
+        await asyncio.sleep(0.05)
+        fd, path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        with open(path, "wb") as fh:
+            fh.write(payload)
+        return path
+
+    monkeypatch.setattr(dl, "_merge_dash_to_temp", fake_merge)
+
+    results = await asyncio.gather(*[
+        client.get(
+            "/download/yt:abc123",
+            params={"key": created_key["api_key"], "kind": "video"},
+            headers={"Range": f"bytes={index * 512}-{(index + 1) * 512 - 1}"},
+        )
+        for index in range(4)
+    ])
+    assert all(r.status_code == 206 for r in results)
+    assert len(merges) == 1, f"the merge must run once, ran {len(merges)} times"
+
+
+@pytest.mark.asyncio
+async def test_cached_merge_is_served_without_the_provider(
+    client, created_key, app_instance, monkeypatch, tmp_path
+):
+    """A merged video on disk is served without asking the provider.
+
+    Resolving the stream costs seconds of yt-dlp work; a client that
+    asks for a video that was merged before must not pay it again.
+    """
+    import app.routes.download as dl
+
+    _isolate_merge_cache(monkeypatch, tmp_path)
+    provider = app_instance.state.provider
+    called = []
+
+    async def fake_resolve(*args, **kwargs):
+        called.append(args)
+        raise AssertionError("the provider must not be asked")
+
+    provider.get_stream_by_type = fake_resolve
+
+    settings = dl.get_settings()
+    path = dl._merge_cache_path(settings, "yt:abc123", 720)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # the cache only holds a complete file, the route ignores a partial one
+    payload = b"FAKEMERGE" * 12000
+    path.write_bytes(payload)
+
+    r = await client.get(
+        "/download/yt:abc123",
+        params={"key": created_key["api_key"], "kind": "video"},
+    )
+    assert r.status_code == 200
+    assert r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-length"] == str(len(payload))
+    assert r.content == payload
+    assert not called
+
+
+@pytest.mark.asyncio
 async def test_fetch_url_to_temp_writes_parallel_bytes():
     """_fetch_url_to_temp delegates to StreamProxy.fetch_to_temp."""
     import os

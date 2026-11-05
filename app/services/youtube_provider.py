@@ -114,6 +114,18 @@ _YTDLP_RETRY_MARKERS = (
     "Sign in to confirm",
     "Requested format is not available",
 )
+# A failed extraction is either "the video really is gone" or a
+# transient condition (bot wall, rate limit, timeout). Only the first
+# one is a 404, the second one must stay retryable for the client.
+_YTDLP_NOT_FOUND_MARKERS = (
+    "video unavailable",
+    "private video",
+    "members-only",
+    "video has been removed",
+    "this video is not available",
+    "account associated with this video has been terminated",
+    "premieres in",
+)
 # Formats the android client does not serve; let yt-dlp fall back within
 # the same invocation (18 → 251/bestaudio).
 _ANDROID_EXTRA_ARGS = ("-4", "--extractor-args", "youtube:player_client=android")
@@ -328,6 +340,27 @@ def _log_ytdlp_fail(op: str, target: str, stderr: str) -> None:
     logger.warning(
         "ytdlp_fail", extra={"op": op, "target": target, "stderr_tail": " | ".join(tail)}
     )
+
+
+def _classify_ytdlp_failure(stderr: str) -> str:
+    """Classify a failed extraction.
+
+    ``not_found`` means the video itself is gone (a 404 for the
+    client), ``transient`` means the extraction was blocked, rate
+    limited or timed out (the client must retry, not give up).
+    """
+    low = (stderr or "").lower()
+    if any(marker in low for marker in _YTDLP_NOT_FOUND_MARKERS):
+        return "not_found"
+    return "transient"
+
+
+def _failure_reason(stderr: str) -> str:
+    """A short, log-safe reason of a failed extraction."""
+    tail = (stderr or "").strip().splitlines()
+    if not tail:
+        return "no error output"
+    return tail[-1][:180]
 
 
 def _vtt_seconds(raw: str) -> float:
@@ -654,6 +687,14 @@ class YouTubeProvider(MediaProvider):
         # Caption payloads are stable and big-ish; keep a small capped
         # TTL map instead of hitting yt-dlp on every transcript request.
         self._transcript_cache: dict[str, Tuple[float, dict]] = {}
+        # Reason of the last failed metadata extraction. It separates a
+        # missing video from a blocked or timed-out one.
+        self._last_dump_failure: str = ""
+        # Resolved DASH/HLS splits. The CDN urls of a signed session stay
+        # valid for hours, but resolving a split costs seconds of yt-dlp
+        # work, so a merged video that is fetched again reuses them.
+        self._split_cache: dict[str, Tuple[float, _VideoSplit]] = {}
+        self._split_cache_ttl = float(get_settings().video_split_cache_ttl or 0)
 
     def _cache_get(self, video_id: str) -> Optional[MediaMetadata]:
         if self._info_cache_ttl <= 0:
@@ -758,6 +799,10 @@ class YouTubeProvider(MediaProvider):
         keys = (video_id, f"{video_id}:audio", f"{video_id}:video")
         for key in keys:
             self._stream_cache.pop(key, None)
+        # A rejected CDN url belongs to a split as well: the split cache
+        # would hand the same dead urls out again.
+        for cache_key in [k for k in self._split_cache if video_id in k]:
+            self._split_cache.pop(cache_key, None)
         if self._stream_cache_service is not None:
             for key in keys:
                 try:
@@ -852,9 +897,17 @@ class YouTubeProvider(MediaProvider):
             logger.warning("youtube_data_api_search_error", extra={"err": str(e)})
             return []
 
+    # Player clients tried when the default extraction is blocked. A
+    # walled web client is often answered by another client on the same
+    # URL, and the client that answers is the one that carries the
+    # formats.
+    _DUMP_FALLBACK_CLIENTS = ("web_embedded", "tv", "web_safari")
+
     async def _ytdlp_dump_json(self, target: str) -> Optional[dict]:
         if not self._ytdlp_argv:
+            self._last_dump_failure = "yt-dlp is not installed"
             return None
+        timeout = float(get_settings().youtube_ytdlp_timeout or _YTDLP_TIMEOUT)
         args = [
             "--dump-json",
             "--no-warnings",
@@ -866,15 +919,65 @@ class YouTubeProvider(MediaProvider):
             *_proxy_args(self.proxy),
             target,
         ]
-        result = await _run_ytdlp(*args)
-        if not result.ok or not result.data:
-            _log_ytdlp_fail("dump", target, result.stderr)
+        result = await _run_ytdlp(*args, timeout=timeout)
+        if result.ok and result.data:
+            info = self._parse_dump(result.data)
+            if info is not None:
+                return info
+            self._last_dump_failure = "the extraction returned no usable metadata"
             return None
+        stderr = result.stderr or ""
+        _log_ytdlp_fail("dump", target, stderr)
+        kind = _classify_ytdlp_failure(stderr)
+        if kind == "transient":
+            # A blocked extraction is not a missing video: another
+            # player client often answers the same URL.
+            info = await self._ytdlp_dump_json_fallback(target, timeout)
+            if info is not None:
+                return info
+        self._last_dump_failure = (
+            kind if kind == "not_found" else f"transient: {_failure_reason(stderr)}"
+        )
+        return None
+
+    async def _ytdlp_dump_json_fallback(
+        self, target: str, timeout: float
+    ) -> Optional[dict]:
+        """Retry a failed extraction with other player clients."""
+        base = [
+            "--dump-json",
+            "--no-warnings",
+            "--no-update",
+            "--skip-download",
+            "--socket-timeout", "20",
+            *_cookies_args(self.cookies_file),
+            *_js_runtime_args(),
+            *_proxy_args(self.proxy),
+        ]
+        for client in self._DUMP_FALLBACK_CLIENTS:
+            args = [
+                *base,
+                "--extractor-args", f"youtube:player_client={client}",
+                target,
+            ]
+            result = await _run_ytdlp(*args, timeout=timeout)
+            if not result.ok or not result.data:
+                continue
+            info = self._parse_dump(result.data)
+            if info is not None:
+                logger.info("ytdlp_client_fallback", extra={"client": client})
+                return info
+        return None
+
+    @staticmethod
+    def _parse_dump(raw: Any) -> Optional[dict]:
+        """Read the first JSON line of a ``--dump-json`` answer."""
         try:
-            first_line = result.data.decode(errors="ignore").splitlines()[0]
-            return json.loads(first_line)
+            first_line = raw.decode(errors="ignore").splitlines()[0]
+            parsed = json.loads(first_line)
         except Exception:
             return None
+        return parsed if isinstance(parsed, dict) else None
 
     async def _ytdlp_info_and_url(
         self, target: str, media_type: str
@@ -946,13 +1049,44 @@ class YouTubeProvider(MediaProvider):
         fetchable media is returned for the non-HLS modes — a
         manifest URL is never handed out as if it were a file.
 
-        Concurrent callers asking for the same target and height
-        share one extraction (single flight).
+        A resolved split is reused for a while: the CDN urls of a
+        signed session stay valid for hours and the extraction costs
+        seconds. Concurrent callers asking for the same target and
+        height share one extraction (single flight).
         """
-        return await _coalesce(
+        cache_key = f"{max_height}:{target}"
+        cached = self._split_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        split = await _coalesce(
             f"split:{max_height}:{target}",
             lambda: self._ytdlp_video_split_once(target, max_height),
         )
+        if split is not None:
+            self._split_cache_put(cache_key, split)
+        return split
+
+    def _split_cache_get(self, cache_key: str) -> Optional[_VideoSplit]:
+        if self._split_cache_ttl <= 0:
+            return None
+        entry = self._split_cache.get(cache_key)
+        if entry is None:
+            return None
+        expires, split = entry
+        if expires < time.time():
+            self._split_cache.pop(cache_key, None)
+            return None
+        return split
+
+    def _split_cache_put(self, cache_key: str, split: _VideoSplit) -> None:
+        if self._split_cache_ttl <= 0:
+            return
+        self._split_cache[cache_key] = (time.time() + self._split_cache_ttl, split)
+        if len(self._split_cache) > 256:
+            now = time.time()
+            stale = [key for key, (exp, _) in self._split_cache.items() if exp < now]
+            for key in stale:
+                self._split_cache.pop(key, None)
 
     async def _ytdlp_video_split_once(
         self, target: str, max_height: Optional[int] = None
@@ -1091,8 +1225,17 @@ class YouTubeProvider(MediaProvider):
             return cached
         info = await self._data_api_video(video_id)
         if info is None:
+            self._last_dump_failure = ""
             info = await self._ytdlp_dump_json(self._watch_url(video_id))
         if info is None:
+            reason = self._last_dump_failure or ""
+            if reason.startswith("transient"):
+                # The extraction was blocked or timed out, the video is
+                # not gone. A 503 keeps the request retryable, a 404
+                # would tell the client the media does not exist.
+                raise ProviderUnavailableError(
+                    f"youtube: extraction failed for {video_id} ({reason})"
+                )
             raise MediaNotFoundError(f"youtube: no info for {video_id}")
         meta = _to_metadata(video_id, info)
         self._cache_put(video_id, meta)

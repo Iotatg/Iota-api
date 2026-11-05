@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import AsyncIterator, Optional, Tuple
+from typing import AsyncIterator, Awaitable, Callable, Optional, Tuple
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -132,6 +133,91 @@ async def _fetch_url_to_temp(
     )
 
 
+# ── Single-flight merge ───────────────────────────────────────────
+# A DASH/HLS merge fetches both streams and runs ffmpeg over them.
+# A client that downloads in parallel sends one request per chunk, and
+# every one of them would start its own merge: six merges for one file
+# starve the box and the client sees no bytes for minutes. One merge
+# per cache key is enough, the other requests wait for it and then
+# serve the cached file.
+_merge_flights: dict[str, asyncio.Task] = {}
+_merge_flight_guard = asyncio.Lock()
+
+
+async def _single_flight(key: str, factory: Callable[[], Awaitable[str]]) -> str:
+    """Run one merge per key; parallel requests share its result."""
+    async with _merge_flight_guard:
+        task = _merge_flights.get(key)
+        if task is None:
+            task = asyncio.ensure_future(factory())
+            _merge_flights[key] = task
+    try:
+        # shield: a cancelled caller must not kill the shared merge,
+        # the other callers still need the file.
+        return await asyncio.shield(task)
+    finally:
+        if task.done():
+            async with _merge_flight_guard:
+                if _merge_flights.get(key) is task:
+                    _merge_flights.pop(key, None)
+
+
+def _guard_merged_size(settings, path: str, size: int) -> None:
+    """Refuse a merged video that is bigger than the limit.
+
+    The size of an HLS remux is unknown before it ran, so the check
+    happens after it. The file is removed, a chat cannot take it.
+    """
+    limit = int(getattr(settings, "video_max_bytes", 0) or 0)
+    if limit <= 0 or size <= limit:
+        return
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+    raise HTTPException(status_code=413, detail={
+        "error": "video_too_large",
+        "detail": (
+            f"the video is {size} bytes, the limit is {limit}. "
+            "Ask for a lower resolution."
+        ),
+    })
+
+
+async def _guard_video_size(
+    settings,
+    src: StreamSource,
+    stream_proxy: StreamProxy,
+    provider: MediaProvider,
+    media_id: str,
+) -> None:
+    """Refuse a video that is bigger than the limit.
+
+    The size of the two DASH streams is known before they are fetched,
+    so a video that no chat can take is refused in a moment instead of
+    after a multi-minute merge of gigabytes.
+    """
+    limit = int(getattr(settings, "video_max_bytes", 0) or 0)
+    if limit <= 0:
+        return
+    try:
+        video_head = await stream_proxy.head(src.direct_url)
+        audio_head = await stream_proxy.head(src.direct_url_audio)
+    except ProviderUnavailableError:
+        # The size stays unknown, the merge itself is bounded by the
+        # file limit check after it ran.
+        return
+    total = video_head.size_bytes + audio_head.size_bytes
+    if total <= limit:
+        return
+    await _invalidate_upstream(provider, media_id)
+    raise HTTPException(status_code=413, detail={
+        "error": "video_too_large",
+        "detail": (
+            f"the video is {total} bytes, the limit is {limit}. "
+            "Ask for a lower resolution."
+        ),
+    })
+
+
 async def _merge_dash_to_temp(
     stream_proxy: StreamProxy,
     video_url: str,
@@ -148,8 +234,12 @@ async def _merge_dash_to_temp(
     video_tmp: Optional[str] = None
     audio_tmp: Optional[str] = None
     try:
-        video_tmp = await _fetch_url_to_temp(stream_proxy, video_url, workers)
-        audio_tmp = await _fetch_url_to_temp(stream_proxy, audio_url, workers)
+        # Both streams are fetched at the same time: the audio stream is
+        # small, but it used to wait for the whole video download.
+        video_tmp, audio_tmp = await asyncio.gather(
+            _fetch_url_to_temp(stream_proxy, video_url, workers),
+            _fetch_url_to_temp(stream_proxy, audio_url, workers),
+        )
         fd, path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
         cmd = [
@@ -276,6 +366,25 @@ def _merge_cache_path(settings, media_id: str, max_height: Optional[int]) -> Pat
     return Path(settings.video_merge_cache_dir) / f"{safe}.{height}.mp4"
 
 
+def _cached_merge_file(
+    settings, media_id: str, max_height: Optional[int], kind: str
+) -> Optional[Path]:
+    """The merged video of a media id, when it is already on disk.
+
+    Only a video download can use it, and only the ids of the provider
+    that produces DASH/HLS merges (YouTube) carry such a file.
+    """
+    if kind != "video" or not media_id.startswith("yt:"):
+        return None
+    path = _merge_cache_path(settings, media_id, max_height)
+    try:
+        if path.is_file() and path.stat().st_size > 100_000:
+            return path
+    except OSError:
+        return None
+    return None
+
+
 def _stash_merge_cache(settings, cache_path: Path, merged_tmp: str) -> None:
     """Move a freshly merged temp file into the cache (best effort).
 
@@ -317,7 +426,9 @@ def _trim_merge_cache(settings) -> None:
     if total <= budget:
         return
     fresh = time.time() - 900
-    for _, sz, p in sorted(sized, reverse=True):
+    # Oldest first: a file that was just merged is the one a client is
+    # waiting for, the stale ones are the ones nobody asks for again.
+    for _, sz, p in sorted(sized):
         if total <= budget:
             break
         try:
@@ -327,6 +438,8 @@ def _trim_merge_cache(settings) -> None:
             continue
         try:
             p.unlink()
+            with contextlib.suppress(OSError):
+                p.with_suffix(".json").unlink()
             total -= sz
         except OSError:
             break
@@ -367,6 +480,35 @@ async def _metadata_for(
         return meta.title or media_id, meta.artist or ""
     except Exception:
         return media_id, ""
+
+
+def _merge_cache_title(path: Path) -> str:
+    """The title of a merged video, when it was stored beside it.
+
+    The metadata of a video costs an extraction of seconds, so the
+    title of a merged file is written next to it. A cached video is
+    then served without asking the provider at all.
+    """
+    try:
+        raw = path.with_suffix(".json").read_text(errors="ignore")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("title") or "")
+
+
+def _store_merge_cache_title(path: Path, title: str) -> None:
+    """Write the title of a merged video next to the file."""
+    if not title:
+        return
+    try:
+        path.with_suffix(".json").write_text(
+            json.dumps({"title": title}), encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 async def _serve_mp3(
@@ -619,36 +761,55 @@ async def _do_download(
         hard = max(1, settings.video_max_height_hard_cap)
         effective_height = min(max(1, requested), hard)
 
+    # ── 1b. Merged video on disk ──────────────────────────────────
+    # A merged DASH/HLS video is a complete file on disk. When it is
+    # there, the client gets it without asking the provider: resolving
+    # the stream costs seconds of yt-dlp work and the bytes are ready.
+    cached_merge = _cached_merge_file(settings, media_id, effective_height, kind)
+
     # ── 2. Provider → resolve a stream source for the requested kind
     # (a mirror copy, when one exists and the provider is down, is
     # reached through relay_source's tier chain — the live provider is
     # always faster than the mirror host and is tried first.)
-    try:
-        src = await provider.get_stream_by_type(
-            media_id, kind, prefer_dash=(kind == "video"), max_height=effective_height
+    if cached_merge is not None:
+        src = StreamSource(
+            storage_key="",
+            size_bytes=cached_merge.stat().st_size,
+            mime_type="video/mp4",
         )
-    except MediaNotFoundError:
-        raise HTTPException(status_code=404, detail={
-            "error": "media_not_found",
-            "detail": f"No media with id {media_id!r}.",
-        })
-    except ProviderUnavailableError as e:
-        src = await relay_source(provider, media_id, kind)
-        if src is None:
-            raise HTTPException(status_code=503, detail={
-                "error": "provider_unavailable",
+    else:
+        try:
+            src = await provider.get_stream_by_type(
+                media_id, kind, prefer_dash=(kind == "video"), max_height=effective_height
+            )
+        except MediaNotFoundError:
+            raise HTTPException(status_code=404, detail={
+                "error": "media_not_found",
+                "detail": f"No media with id {media_id!r}.",
+            })
+        except ProviderUnavailableError as e:
+            src = await relay_source(provider, media_id, kind)
+            if src is None:
+                raise HTTPException(status_code=503, detail={
+                    "error": "provider_unavailable",
+                    "detail": str(e),
+                })
+        except ProviderError as e:
+            raise HTTPException(status_code=502, detail={
+                "error": "provider_error",
                 "detail": str(e),
             })
-    except ProviderError as e:
-        raise HTTPException(status_code=502, detail={
-            "error": "provider_error",
-            "detail": str(e),
-        })
 
     # ── 2a. Telemetry: a successful download request ─────────────
+    # The title is resolved once and reused for the file name. A
+    # merged video carries its title beside it, so a cached video is
+    # served without an extraction.
+    title = _merge_cache_title(cached_merge) if cached_merge is not None else ""
+    if not title:
+        title = await _title_for(provider, media_id)
     telemetry.record_download(
         media_id,
-        title=await _title_for(provider, media_id),
+        title=title,
         provider=provider_of(media_id),
         size_bytes=src.size_bytes or 0,
     )
@@ -668,14 +829,26 @@ async def _do_download(
     delete_dash_after = False
     merge_cache_path: Optional[Path] = None
     size_known = True
-    if src.is_dash and src.direct_url and src.direct_url_audio:
+    if cached_merge is not None:
+        # The merged video is on disk: no provider call, no merge, the
+        # file is served Range-capable right away.
+        mime_type = "video/mp4"
+        dash_tmp_path = str(cached_merge)
+        size = cached_merge.stat().st_size
+        stream_kind = "dash_cache"
+        stream_target = dash_tmp_path
+    elif src.is_dash and src.direct_url and src.direct_url_audio:
         # High-quality video: two progressive DASH streams that must
         # be remuxed together. A prior merge may be cached on disk —
         # serve it directly and skip the multi-minute refetch.
-        # Without a cache hit, for GET we merge the streams into a
-        # temp file with ffmpeg and serve it Range-capable; for
-        # HEAD we approximate the size as the sum of the two
-        # streams so a probe never triggers a full merge.
+        # Without a cache hit, the merge runs once per media id (the
+        # parallel chunk requests of a client share it) and the merged
+        # file is served Range-capable.
+        # A HEAD never remuxes and never guesses a length: the length
+        # of the merged file is unknown until the merge ran, and a
+        # wrong Content-Length makes a range client address bytes that
+        # do not exist. The HEAD therefore reports no size and no range
+        # support, so the client asks for the file with one GET.
         mime_type = "video/mp4"
         merge_cache_path = _merge_cache_path(settings, media_id, effective_height)
         if (
@@ -687,23 +860,31 @@ async def _do_download(
             stream_kind = "dash_cache"
             stream_target = dash_tmp_path
         elif method == "HEAD":
-            try:
-                vhead = await stream_proxy.head(src.direct_url)
-                ahead = await stream_proxy.head(src.direct_url_audio)
-            except ProviderUnavailableError as e:
-                await _invalidate_upstream(provider, media_id)
-                raise HTTPException(status_code=502, detail={
-                    "error": "upstream_unavailable",
-                    "detail": str(e),
-                })
-            size = vhead.size_bytes + ahead.size_bytes
             stream_kind = "dash_head"
             stream_target = ""
+            size = 0
+            size_known = False
         else:
-            try:
-                dash_tmp_path = await _merge_dash_to_temp(
+            # The size of the two streams is known before the merge: a
+            # 4K stream of a long video is several gigabytes, and
+            # merging it wastes minutes and disk for a file no chat can
+            # take. Such a video is refused before the work starts.
+            await _guard_video_size(settings, src, stream_proxy, provider, media_id)
+
+            async def _merge_dash() -> str:
+                merged_tmp = await _merge_dash_to_temp(
                     stream_proxy, src.direct_url, src.direct_url_audio,
                     settings.stream_parallel_workers,
+                )
+                _stash_merge_cache(settings, merge_cache_path, merged_tmp)
+                _store_merge_cache_title(merge_cache_path, title)
+                if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
+                    return str(merge_cache_path)
+                return merged_tmp
+
+            try:
+                dash_tmp_path = await _single_flight(
+                    str(merge_cache_path), _merge_dash
                 )
             except ProviderUnavailableError as e:
                 await _invalidate_upstream(provider, media_id)
@@ -711,16 +892,13 @@ async def _do_download(
                     "error": "upstream_unavailable",
                     "detail": str(e),
                 })
-            _stash_merge_cache(settings, merge_cache_path, dash_tmp_path)
-            if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
-                # Cache now owns the merged bytes; serve from the
-                # cached copy so later requests reuse it too.
-                dash_tmp_path = str(merge_cache_path)
+            if dash_tmp_path == str(merge_cache_path):
                 stream_kind = "dash_cache"
             else:
                 stream_kind = "dash_temp"
                 delete_dash_after = True
             size = os.path.getsize(dash_tmp_path)
+            _guard_merged_size(settings, dash_tmp_path, size)
             stream_target = dash_tmp_path
     elif src.is_hls and src.direct_url:
         # Manifest-based video: an m3u8 playlist describes segments
@@ -745,9 +923,19 @@ async def _do_download(
             size = 0
             size_known = False
         else:
-            try:
-                dash_tmp_path = await _merge_hls_to_temp(
+            async def _merge_hls() -> str:
+                merged_tmp = await _merge_hls_to_temp(
                     src.direct_url, src.direct_url_audio
+                )
+                _stash_merge_cache(settings, merge_cache_path, merged_tmp)
+                _store_merge_cache_title(merge_cache_path, title)
+                if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
+                    return str(merge_cache_path)
+                return merged_tmp
+
+            try:
+                dash_tmp_path = await _single_flight(
+                    str(merge_cache_path), _merge_hls
                 )
             except ProviderUnavailableError as e:
                 await _invalidate_upstream(provider, media_id)
@@ -755,14 +943,13 @@ async def _do_download(
                     "error": "upstream_unavailable",
                     "detail": str(e),
                 })
-            _stash_merge_cache(settings, merge_cache_path, dash_tmp_path)
-            if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
-                dash_tmp_path = str(merge_cache_path)
+            if dash_tmp_path == str(merge_cache_path):
                 stream_kind = "hls_cache"
             else:
                 stream_kind = "hls_temp"
                 delete_dash_after = True
             size = os.path.getsize(dash_tmp_path)
+            _guard_merged_size(settings, dash_tmp_path, size)
             stream_target = dash_tmp_path
     elif src.direct_url:
         # A playlist URL would otherwise be proxied as if it were the
@@ -785,22 +972,31 @@ async def _do_download(
                 size = 0
                 size_known = False
             else:
+                async def _merge_manifest() -> str:
+                    merged_tmp = await _merge_hls_to_temp(src.direct_url, None)
+                    _stash_merge_cache(settings, merge_cache_path, merged_tmp)
+                    _store_merge_cache_title(merge_cache_path, title)
+                    if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
+                        return str(merge_cache_path)
+                    return merged_tmp
+
                 try:
-                    dash_tmp_path = await _merge_hls_to_temp(src.direct_url, None)
+                    dash_tmp_path = await _single_flight(
+                        str(merge_cache_path), _merge_manifest
+                    )
                 except ProviderUnavailableError as e:
                     await _invalidate_upstream(provider, media_id)
                     raise HTTPException(status_code=502, detail={
                         "error": "upstream_unavailable",
                         "detail": str(e),
                     })
-                _stash_merge_cache(settings, merge_cache_path, dash_tmp_path)
-                if merge_cache_path.is_file() and merge_cache_path.stat().st_size > 0:
-                    dash_tmp_path = str(merge_cache_path)
+                if dash_tmp_path == str(merge_cache_path):
                     stream_kind = "hls_cache"
                 else:
                     stream_kind = "hls_temp"
                     delete_dash_after = True
                 size = os.path.getsize(dash_tmp_path)
+                _guard_merged_size(settings, dash_tmp_path, size)
                 stream_target = dash_tmp_path
         else:
             try:
@@ -849,7 +1045,7 @@ async def _do_download(
     content_length = end - start + 1 if size_known else None
 
     # ── 6. Filename from metadata (best effort) ─────────────────────
-    title = await _title_for(provider, media_id)
+    # The title was resolved in step 2a, it is reused here.
     filename = f"{_safe_filename(title, media_id)}.{_extension_for(mime_type, media_id)}"
 
     # ── 7. Bookkeeping ──────────────────────────────────────────────
