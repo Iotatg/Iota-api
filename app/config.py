@@ -185,6 +185,10 @@ class Settings(BaseSettings):
     # Upstream proxy timeout (seconds) for the StreamProxy.
     stream_proxy_connect_timeout: float = 10.0
     stream_proxy_read_timeout: float = 60.0
+    # Folder of the ffmpeg binary used for the merges and the mp3 transcode.
+    # A build that crashes on a fragmented mp4 has to be replaced by a known
+    # good one, the PATH of the container can point at the broken build.
+    ffmpeg_location: str = ""
 
     # ── Security ──────────────────────────────────────────────────────────
     cors_allow_origins: str = "*"

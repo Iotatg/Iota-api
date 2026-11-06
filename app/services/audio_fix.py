@@ -29,6 +29,7 @@ from typing import Dict, Optional
 from app.config import get_settings
 from app.services.media_provider import StreamSource
 from app.utils.logging import get_logger
+from app.utils.ffmpeg import ffmpeg_binary
 
 logger = get_logger(__name__)
 
@@ -72,7 +73,7 @@ def _ffmpeg_args(
     title: Optional[str] = None,
     artist: Optional[str] = None,
 ) -> list:
-    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    base = [ffmpeg_binary(), "-hide_banner", "-loglevel", "error", "-y"]
     if url.startswith("http://") or url.startswith("https://"):
         base += [
             "-user_agent", _UA,

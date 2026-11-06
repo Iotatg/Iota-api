@@ -55,6 +55,7 @@ from app.services.media_provider import (
 from app.services.storage import StorageService
 from app.services.stream_fallback import relay_source
 from app.services.stream_proxy import StreamProxy
+from app.utils.ffmpeg import ffmpeg_binary
 from app.utils.logging import get_logger
 from app.utils.metrics import (
     active_streams,
@@ -243,7 +244,7 @@ async def _merge_dash_to_temp(
         fd, path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error",
             "-i", video_tmp,
             "-i", audio_tmp,
             "-c", "copy",
@@ -302,7 +303,7 @@ async def _merge_hls_to_temp(
     fd, path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error",
         "-timeout", "600000000",
         "-i", video_url,
     ]
