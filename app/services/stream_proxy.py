@@ -41,13 +41,13 @@ _READ_TIMEOUT = 60.0
 
 # How many chunks each parallel segment may buffer ahead of the
 # consumer. Keeps memory bounded regardless of file size.
-_PARALLEL_QUEUE_DEPTH = 8
+_PARALLEL_QUEUE_DEPTH = 24
 # Default number of concurrent Range connections. CDNs such as
 # YouTube's googlevideo throttle a single TCP stream to a few
 # dozen KB/s but allow several MB/s in aggregate, so a handful of
 # connections lifts throughput dramatically (the same technique
 # yt-dlp uses for its chunked downloader).
-_PARALLEL_WORKERS = 4
+_PARALLEL_WORKERS = 8
 # Attempts per parallel segment before the fetch fails. Google Video
 # CDN connections can stall or reset mid-transfer on large (4K)
 # segments; resuming from the bytes already received recovers cheaply.

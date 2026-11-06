@@ -519,6 +519,49 @@ def _url_is_manifest(url: Optional[str]) -> bool:
     return ".m3u8" in low or ".mpd" in low or "manifest" in low
 
 
+def _pick_audio_url(info: dict) -> Optional[str]:
+    """Pick the best audio stream of a yt-dlp dump.
+
+    The m4a streams come first (the mp3 transcode reads them without a
+    remux), the highest bitrate wins. Only a progressive file is
+    returned; a manifest is left to the normal yt-dlp path.
+    """
+    best_m4a: Optional[dict] = None
+    best_any: Optional[dict] = None
+    for fmt in info.get("formats") or []:
+        if not isinstance(fmt, dict):
+            continue
+        if str(fmt.get("vcodec") or "none") != "none":
+            continue
+        if str(fmt.get("acodec") or "none") == "none":
+            continue
+        if _is_manifest_format(fmt):
+            continue
+        url = fmt.get("url")
+        if not url or not str(url).startswith("http"):
+            continue
+        bitrate = 0
+        for key in ("abr", "bitrate"):
+            value = fmt.get(key)
+            if isinstance(value, (int, float)):
+                bitrate = int(value)
+                break
+        fmt = dict(fmt)
+        fmt["_picked_bitrate"] = bitrate
+        if fmt.get("ext") == "m4a":
+            if best_m4a is None or bitrate > best_m4a["_picked_bitrate"]:
+                best_m4a = fmt
+        if best_any is None or bitrate > best_any["_picked_bitrate"]:
+            best_any = fmt
+    chosen = best_m4a or best_any
+    if chosen is None:
+        return None
+    url = str(chosen.get("url") or "")
+    if _url_is_manifest(url):
+        return None
+    return url
+
+
 @dataclass
 class _VideoSplit:
     """A selected video representation for a download.
@@ -695,6 +738,34 @@ class YouTubeProvider(MediaProvider):
         # work, so a merged video that is fetched again reuses them.
         self._split_cache: dict[str, Tuple[float, _VideoSplit]] = {}
         self._split_cache_ttl = float(get_settings().video_split_cache_ttl or 0)
+        # Raw yt-dlp dumps. The metadata of a video and its DASH/HLS split
+        # come out of the same dump, so a client that asks for the info
+        # first and for the download afterwards pays for one extraction
+        # instead of two.
+        self._dump_cache: dict[str, Tuple[float, dict]] = {}
+        self._dump_cache_ttl = float(get_settings().video_split_cache_ttl or 0)
+
+    def _dump_cache_get(self, target: str) -> Optional[dict]:
+        if self._dump_cache_ttl <= 0:
+            return None
+        hit = self._dump_cache.get(target)
+        if not hit:
+            return None
+        expires, info = hit
+        if time.monotonic() > expires:
+            self._dump_cache.pop(target, None)
+            return None
+        return info
+
+    def _dump_cache_put(self, target: str, info: dict) -> None:
+        if self._dump_cache_ttl <= 0:
+            return
+        if len(self._dump_cache) >= 64:
+            now = time.monotonic()
+            stale = [k for k, (exp, _) in self._dump_cache.items() if exp <= now]
+            for k in stale:
+                self._dump_cache.pop(k, None)
+        self._dump_cache[target] = (time.monotonic() + self._dump_cache_ttl, info)
 
     def _cache_get(self, video_id: str) -> Optional[MediaMetadata]:
         if self._info_cache_ttl <= 0:
@@ -907,6 +978,9 @@ class YouTubeProvider(MediaProvider):
         if not self._ytdlp_argv:
             self._last_dump_failure = "yt-dlp is not installed"
             return None
+        cached = self._dump_cache_get(target)
+        if cached is not None:
+            return cached
         timeout = float(get_settings().youtube_ytdlp_timeout or _YTDLP_TIMEOUT)
         args = [
             "--dump-json",
@@ -923,6 +997,7 @@ class YouTubeProvider(MediaProvider):
         if result.ok and result.data:
             info = self._parse_dump(result.data)
             if info is not None:
+                self._dump_cache_put(target, info)
                 return info
             self._last_dump_failure = "the extraction returned no usable metadata"
             return None
@@ -966,6 +1041,7 @@ class YouTubeProvider(MediaProvider):
             info = self._parse_dump(result.data)
             if info is not None:
                 logger.info("ytdlp_client_fallback", extra={"client": client})
+                self._dump_cache_put(target, info)
                 return info
         return None
 
@@ -1011,6 +1087,15 @@ class YouTubeProvider(MediaProvider):
             )
         else:
             fmt = "bestaudio[ext=m4a]/bestaudio/best"
+        # A dump of the same video is already at hand (the metadata of a
+        # request comes first), the audio stream can be picked out of it
+        # without a second extraction.
+        if media_type == "audio":
+            cached = self._dump_cache_get(target)
+            if cached is not None:
+                url = _pick_audio_url(cached)
+                if url:
+                    return cached, url
         args = [
             "--dump-json",
             "-f", fmt,
@@ -1093,6 +1178,17 @@ class YouTubeProvider(MediaProvider):
     ) -> Optional[_VideoSplit]:
         if not self._ytdlp_argv:
             return None
+        # The metadata of the video comes out of the same dump, a client
+        # that asked for the info first already paid for it.
+        cached = self._dump_cache_get(target)
+        if cached is not None:
+            if max_height is None:
+                max_height = int(get_settings().youtube_video_max_height or 0)
+            else:
+                max_height = max(0, int(max_height))
+            split = _pick_video_split(cached, max_height)
+            if split is not None:
+                return split
         args = [
             "--dump-json",
             "--no-warnings",
@@ -1113,6 +1209,7 @@ class YouTubeProvider(MediaProvider):
             )
         except Exception:
             return None
+        self._dump_cache_put(target, info)
         if max_height is None:
             max_height = int(get_settings().youtube_video_max_height or 0)
         else:

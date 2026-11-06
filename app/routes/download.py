@@ -125,7 +125,7 @@ async def _fetch_url_to_temp(
     stream_proxy: StreamProxy,
     url: str,
     workers: int,
-    chunk_size: int = 65536,
+    chunk_size: int = 262144,
 ) -> str:
     """Fetch ``url`` to a local temp file via the cookie-bearing
     parallel Range proxy. The caller deletes the file."""

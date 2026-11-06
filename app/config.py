@@ -92,13 +92,15 @@ class Settings(BaseSettings):
     health_check_cache_ttl: float = 5.0
 
     # ── Streaming ─────────────────────────────────────────────────────────
-    stream_chunk_size: int = 65536
+    # Size of the chunks the api hands to the client. A bigger chunk
+    # means fewer round trips between the api and the bot.
+    stream_chunk_size: int = 262144
     stream_default_quality: int = 128
     # Concurrent Range connections per proxied stream. CDNs such as
     # YouTube's googlevideo throttle a single connection to a few
     # dozen KB/s; several connections lift throughput to MB/s.
     # Set to 1 to disable parallel streaming.
-    stream_parallel_workers: int = 4
+    stream_parallel_workers: int = 8
     # How long a resolved upstream stream URL is reused before
     # re-resolving. YouTube CDN URLs are valid for hours, so a
     # short TTL lets repeat plays of the same song skip the

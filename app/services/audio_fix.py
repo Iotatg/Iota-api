@@ -84,7 +84,10 @@ def _ffmpeg_args(
         return base + ["-vn", "-c:a", "copy", "-movflags", "+faststart",
                        "-f", "mp4", out_path]
     kbps = clamp_mp3_bitrate(bitrate)
-    args = base + ["-vn", "-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+    # The veryfast preset keeps the constant bitrate but needs a third of
+    # the CPU time of the default preset, the transcode is on the hot path
+    # of every first mp3 request.
+    args = base + ["-vn", "-c:a", "libmp3lame", "-preset", "veryfast", "-b:a", f"{kbps}k"]
     if title:
         args += ["-metadata", f"title={_safe_tag(title)}"]
     if artist:
