@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -55,15 +56,22 @@ _VTT_TAG_RE = re.compile(r"<[^>]+>")
 def _resolve_ytdlp_argv() -> List[str]:
     """Return the argv prefix that invokes yt-dlp.
 
-    Uses ``python3 -m yt_dlp`` so the same Python environment is used; the
-    raw ``yt-dlp`` script may live in a different venv or be missing on PATH.
+    Prefers the interpreter that is actually running this app (so a venv that
+    ships ``yt-dlp`` is used instead of a system ``python3`` that does not),
+    then the ``yt-dlp`` script on PATH, and finally ``python3 -m yt_dlp``.
     """
-    py = shutil.which("python3") or shutil.which("python")
-    if py:
-        return [py, "-m", "yt_dlp"]
+    try:
+        import yt_dlp  # noqa: F401  (probe: is the module importable here?)
+
+        return [sys.executable or "python3", "-m", "yt_dlp"]
+    except Exception:  # pragma: no cover - depends on the host install
+        pass
     fallback = shutil.which("yt-dlp")
     if fallback:
         return [fallback]
+    py = shutil.which("python3") or shutil.which("python")
+    if py:
+        return [py, "-m", "yt_dlp"]
     return []
 
 
